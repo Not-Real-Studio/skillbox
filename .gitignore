@@ -14,3 +14,7 @@ coverage/
 __pycache__/
 *.pyc
 landing-preview*.html
+dist-worker/
+.wrangler/
+wrangler.toml
+.dev.vars

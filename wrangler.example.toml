@@ -1,0 +1,27 @@
+# Template. Copy to wrangler.toml and fill in your own values; see docs/cloudflare.md.
+name = "skillbox"
+main = "src/server/worker.ts"
+compatibility_date = "2026-09-01"
+# nodejs_compat: node:crypto, node:async_hooks, Buffer, process.env.
+# nodejs_compat_populate_process_env is the default for this date; listed for clarity.
+compatibility_flags = ["nodejs_compat", "nodejs_compat_populate_process_env"]
+
+[assets]
+directory = "dist-worker"          # bun run build:worker
+binding = "ASSETS"
+# The Worker serves every path itself (security headers, SPA fallback, auth),
+# reading files through env.ASSETS.
+run_worker_first = true
+html_handling = "none"
+not_found_handling = "none"
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "<your-hyperdrive-id>"         # wrangler hyperdrive create skillbox --connection-string=...
+# Used by `wrangler dev` only.
+localConnectionString = "postgres://skillbox:skillbox@127.0.0.1:5432/skillbox"
+
+[vars]
+SKILLBOX_ORIGIN = "https://skillbox.example.com"
+SKILLBOX_ALLOWED_ORIGINS = ""
+# Secret, not a var: wrangler secret put SKILLBOX_ADMIN_TOKEN

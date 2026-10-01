@@ -9,7 +9,7 @@ import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import { eq, desc, lt, and, sql } from "drizzle-orm";
 import { db } from "./db";
-import { diskFiles, type StaticFiles } from "./static-files";
+import type { StaticFiles } from "./static-files";
 import { clients, sessions, events, profiles, skills } from "./schema";
 import {
   authenticate,
@@ -32,10 +32,12 @@ export const app = new Hono<{
   Variables: { principal: Principal };
   Bindings: { STATIC?: StaticFiles };
 }>();
-const files = (c: { env?: { STATIC?: StaticFiles } }) =>
-  c.env?.STATIC ?? diskFiles;
+// Entries may pass STATIC (the Worker does); otherwise files come from disk.
+// Lazy so hono/bun, which touches Bun at import, never loads in a Worker.
+const files = async (c: { env?: { STATIC?: StaticFiles } }) =>
+  c.env?.STATIC ?? (await import("./static-files")).diskFiles;
 const required = async (c: Parameters<typeof files>[0], name: string) => {
-  const text = await files(c).text(name);
+  const text = await (await files(c)).text(name);
   if (text === null) throw new Error("Missing static file");
   return text;
 };
@@ -670,16 +672,16 @@ app.get("/cli/package.mjs", async (c) => {
   c.header("Content-Type", "text/javascript");
   return c.body(await required(c, "cli/package.mjs"));
 });
-app.use("/assets/*", (c, next) => files(c).assets(c, next));
+app.use("/assets/*", async (c, next) => (await files(c)).assets(c, next));
 app.get("/favicon.svg", async (c) => {
-  const f = await files(c).text("favicon.svg");
+  const f = await (await files(c)).text("favicon.svg");
   if (f === null) return c.notFound();
   c.header("Content-Type", "image/svg+xml");
   c.header("Cache-Control", "public, max-age=86400");
   return c.body(f);
 });
 app.get("*", async (c) => {
-  const f = await files(c).text("index.html");
+  const f = await (await files(c)).text("index.html");
   return f !== null
     ? c.html(f)
     : c.text("Skillbox API is running. Build the web UI to open the library.");

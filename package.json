@@ -8,11 +8,15 @@
     "dev": "bun --watch src/server/index.ts",
     "dev:ui": "vite --host 127.0.0.1",
     "build": "vite build",
+    "build:worker": "bun scripts/build-worker.ts",
     "start": "bun src/server/index.ts",
+    "migrate": "bun scripts/migrate.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "import": "bun scripts/import.ts",
-    "export": "bun scripts/export.ts"
+    "export": "bun scripts/export.ts",
+    "dev:worker": "wrangler dev",
+    "deploy:worker": "wrangler deploy"
   },
   "dependencies": {
     "@fontsource/dm-sans": "^5.3.0",

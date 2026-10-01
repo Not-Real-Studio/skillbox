@@ -4,12 +4,12 @@ import * as gateway from "./gateway";
 import { appOrigin as origin, allowedOrigins } from "./config";
 import { parseSkillIcon } from "../skill-icons";
 import { Hono } from "hono";
-import { serveStatic } from "hono/bun";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import { eq, desc, lt, and, sql } from "drizzle-orm";
 import { db } from "./db";
+import { diskFiles, type StaticFiles } from "./static-files";
 import { clients, sessions, events, profiles, skills } from "./schema";
 import {
   authenticate,
@@ -28,7 +28,17 @@ import {
   parseGitHubUrl,
   prepareGitHubImport,
 } from "./github-import";
-export const app = new Hono<{ Variables: { principal: Principal } }>();
+export const app = new Hono<{
+  Variables: { principal: Principal };
+  Bindings: { STATIC?: StaticFiles };
+}>();
+const files = (c: { env?: { STATIC?: StaticFiles } }) =>
+  c.env?.STATIC ?? diskFiles;
+const required = async (c: Parameters<typeof files>[0], name: string) => {
+  const text = await files(c).text(name);
+  if (text === null) throw new Error("Missing static file");
+  return text;
+};
 const loginAttempts: number[] = [];
 app.use("*", async (c, next) => {
   c.header("X-Content-Type-Options", "nosniff");
@@ -650,27 +660,27 @@ app.on(["GET", "DELETE"], "/mcp", async (c) => {
   return c.json({ error: "Use POST for stateless MCP" }, 405);
 });
 app.get("/bootstrap/SKILL.md", async (c) =>
-  c.text(await Bun.file("bootstrap/SKILL.md").text()),
+  c.text(await required(c, "bootstrap/SKILL.md")),
 );
 app.get("/cli/skillbox.mjs", async (c) => {
   c.header("Content-Type", "text/javascript");
-  return c.body(await Bun.file("cli/skillbox.mjs").text());
+  return c.body(await required(c, "cli/skillbox.mjs"));
 });
 app.get("/cli/package.mjs", async (c) => {
   c.header("Content-Type", "text/javascript");
-  return c.body(await Bun.file("cli/package.mjs").text());
+  return c.body(await required(c, "cli/package.mjs"));
 });
-app.use("/assets/*", serveStatic({ root: "./dist" }));
+app.use("/assets/*", (c, next) => files(c).assets(c, next));
 app.get("/favicon.svg", async (c) => {
-  const f = Bun.file("./dist/favicon.svg");
-  if (!(await f.exists())) return c.notFound();
+  const f = await files(c).text("favicon.svg");
+  if (f === null) return c.notFound();
   c.header("Content-Type", "image/svg+xml");
   c.header("Cache-Control", "public, max-age=86400");
-  return c.body(await f.text());
+  return c.body(f);
 });
 app.get("*", async (c) => {
-  const f = Bun.file("./dist/index.html");
-  return (await f.exists())
-    ? c.html(await f.text())
+  const f = await files(c).text("index.html");
+  return f !== null
+    ? c.html(f)
     : c.text("Skillbox API is running. Build the web UI to open the library.");
 });

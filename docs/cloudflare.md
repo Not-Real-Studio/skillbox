@@ -1,58 +1,60 @@
-# Cloudflare Workers
+# Cloudflare: Worker + D1 + R2
 
-The same code runs as a Bun process (Docker Compose, `bun src/server/index.ts`) or as a Cloudflare Worker. In the Worker, the Hono app is the `fetch` handler, the web UI, `bootstrap/SKILL.md` and `cli/*.mjs` are Workers Static Assets, and the database is your existing PostgreSQL reached through Hyperdrive. The SQL and the schema are the same in both modes.
+This fork runs only on Cloudflare. One Worker serves the Hono app; the web UI, `bootstrap/SKILL.md` and `cli/*.mjs` are Workers Static Assets; metadata lives in D1; file bytes live in R2. There is no other runtime: locally it is `wrangler dev` with local D1 and R2.
 
-## How the Worker differs from the Bun process
+## Layout
 
-| Concern | Bun | Worker |
-| --- | --- | --- |
-| Entry | `src/server/index.ts` | `src/server/worker.ts` |
-| Database client | one pool per process (`DATABASE_URL`) | one postgres-js client per request from `env.HYPERDRIVE.connectionString`, closed with `ctx.waitUntil`. Business code still imports `db`/`connection`; they resolve to the request's client through `AsyncLocalStorage` |
-| Static files | read from disk (`dist/`, `bootstrap/`, `cli/`) | read through the `ASSETS` binding from `dist-worker/` |
-| Configuration | `process.env`, `*_FILE` secrets | vars and secrets reach `process.env` via `nodejs_compat_populate_process_env`; `*_FILE` is Bun-only |
-| Migrations | on every start | `bun run migrate` once per deploy; the Worker never migrates |
+| Concern | Where |
+| --- | --- |
+| Entry | `src/server/worker.ts` (`export default { fetch }`) |
+| Request context | `src/server/db.ts`: the entry binds `env.DB`/`env.FILES` per request through `AsyncLocalStorage`; business code imports `db` (Drizzle over D1) and `d1` (raw D1) |
+| Schema | `src/server/schema.ts` (Drizzle `sqlite-core`) and `migrations/*.sql` — keep them in step |
+| Files | `src/server/files.ts`: R2 objects `files/<sha256>`; rows hold a manifest `[{path, sha256, size, executable, mime}]` |
+| Search | FTS5 table `skills_fts` (`porter unicode61 remove_diacritics 2`), kept in sync by triggers |
+| Config | vars and secrets reach `process.env` (`nodejs_compat_populate_process_env`) |
 
-**Why the Worker does not check the schema.** `migrate()` is about thirty idempotent DDL statements plus data backfills; running it per request, or even once per isolate, would add database round-trips to cold requests and race between isolates. A cheap version check would need a schema-version table that upstream does not have, i.e. a schema change only for this port. So migration is a deploy step (`bun run migrate` against the same database, before `wrangler deploy`). If it is skipped, requests touching new columns fail with a 500 and the Worker log shows the SQL error.
+### What changed from PostgreSQL
+
+- **Types.** JSON in `TEXT` (`mode: "json"`), timestamps as ISO-8601 `TEXT` (they sort as time), booleans as `0/1`, UUID defaults generated in code.
+- **Files.** A revision used to carry all its files base64 in one `jsonb` row; D1 rows are limited to 2 MB and an 8 MB skill would not fit. Now each file is an R2 object addressed by its SHA-256, so identical bytes are stored once across revisions and skills. Publishing writes R2 first, then the row; R2 verifies the digest on upload and the app re-verifies it on every read. Proposals use the same store. Objects are never deleted, so a failed publish can leave an unreferenced object, never a dangling manifest.
+- **Transactions.** D1 has no interactive transactions, row locks or advisory locks. `publish` runs one atomic `batch`: the first statement writes the skill row only if it still has the expected revision (and, when bundle edges, lifecycle or replacement change, only if the library graph version read before validation is unchanged); every following statement (revision row, event, profile grant, graph version bump, proposal status) is conditional on that write having happened. A lost race is the same 409 as before and changes nothing. Profile names and active client names are unique indexes on a normalized `name_key` (SQLite's `lower()` is ASCII-only, so normalization happens in code); a profile update carries its version in the `UPDATE`; deleting a profile is one conditional `DELETE`; approving a proposal publishes and closes it in the same batch, guarded by `status='pending'`; provider settings use compare-and-swap on the stored value.
+- **JSON queries.** `context->>'source'` works as is in SQLite; `skill_ids || …` became `json_insert(skill_ids, '$[#]', ?)`; `LATERAL` joins became correlated subqueries. Long ID lists are passed as one JSON parameter (`IN (SELECT value FROM json_each(?))`) because D1 allows at most 100 bound parameters per query.
+- **Search.** Every word of the query must match in `skills_fts` as a prefix (`"word"*`), ranked by `bm25()`; plus `LIKE` substring matches on the ID and description, ranked last. `porter` stems English; other scripts, Russian included, are tokenized by `unicode61` without stemming — the prefix match covers most inflections (`ремонт` finds `ремонта`), not all (`окно` does not find `окна`).
+- **Removed:** the legacy-grant migration (clients without a profile), the Docker/Compose/Umbrel tooling, folder import/export and PostgreSQL backups. Use `scripts/import-from-skillbox.ts` to move an instance and D1 Time Travel / `wrangler d1 export` for backups (R2 objects are immutable and content-addressed).
 
 ## Deploy
 
-Requirements: a Cloudflare account with Workers, a PostgreSQL 14+ database reachable from the internet (Neon, Supabase, your own server with TLS), Bun locally.
+1. `cp wrangler.example.toml wrangler.toml` (git-ignored). Set `name` and `SKILLBOX_ORIGIN` (the public HTTPS origin), optionally `SKILLBOX_ALLOWED_ORIGINS`.
+2. `bunx wrangler d1 create skillbox` → put the `database_id` into `[[d1_databases]]`.
+3. `bunx wrangler r2 bucket create skillbox-files` (or your name in `[[r2_buckets]] bucket_name`). Keep the bucket private; the Worker is its only reader.
+4. `openssl rand -base64 48 | bunx wrangler secret put SKILLBOX_ADMIN_TOKEN` (32+ characters). It also derives the key that encrypts stored provider credentials; rotating it means reconnecting them. Without it the Worker answers 503.
+5. `bun run deploy` — builds `dist-worker/`, applies pending `migrations/` to the remote D1, deploys. Migrations are a deploy step; the Worker never migrates or checks the schema.
+6. Add a custom domain to the Worker equal to `SKILLBOX_ORIGIN`.
+7. Add a WAF rate-limiting rule for `POST /api/login`: the built-in limiter is per isolate.
 
-1. **Configuration.** `cp wrangler.example.toml wrangler.toml` (ignored by git). Set `name`, `SKILLBOX_ORIGIN` (the public HTTPS origin, e.g. `https://skills.example.com`) and, if needed, `SKILLBOX_ALLOWED_ORIGINS` (comma-separated extra origins).
-2. **Hyperdrive.** Create it over your database **with caching disabled**:
-   ```sh
-   bunx wrangler@4.146.0 hyperdrive create skillbox \
-     --connection-string="postgres://USER:PASSWORD@HOST:5432/DB" --caching-disabled
-   ```
-   Put the printed id into `[[hyperdrive]] id`. Hyperdrive caches read queries by default; Skillbox relies on reading its own writes (revisions, `expectedRevision` checks, sessions), so a cached `SELECT` could return stale skills, revisions, clients or sessions (e.g. a revoked key still accepted) for up to the cache TTL.
-3. **Schema.** `DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/DB" bun run migrate` — the same database as in step 2. Repeat on every upgrade, before deploying.
-4. **Admin token.** `openssl rand -base64 48 | bunx wrangler@4.146.0 secret put SKILLBOX_ADMIN_TOKEN` (at least 32 characters). It also derives the key that encrypts stored integration credentials, see [deployment](deployment.md) before rotating it. Without it the Worker answers 503.
-5. **Build and deploy.** `bun install && bun run build:worker && bun run deploy:worker`.
-6. **Domain.** Add a custom domain to the Worker (Workers & Pages → the Worker → Settings → Domains & Routes, or `routes = [{ pattern = "skills.example.com", custom_domain = true }]` in `wrangler.toml`) and make sure it equals `SKILLBOX_ORIGIN`.
-7. **Login protection.** The built-in login limiter (10 failures per minute) is per isolate, and Cloudflare runs many isolates. Add a WAF rate-limiting rule for `POST /api/login`.
-
-Clients connect exactly as with a self-hosted instance: `SKILLBOX_URL=https://skills.example.com`, `/mcp` for MCP, `/cli/skillbox.mjs` for the CLI.
+Moving an existing instance: deploy, then run `scripts/import-from-skillbox.ts` (see the README) and `scripts/verify-import.ts`.
 
 ## Local run and acceptance
 
 ```sh
-# Any disposable Postgres database; nothing in Cloudflare is needed.
-DATABASE_URL=postgres://user:pass@127.0.0.1:5432/skillbox_worker bash scripts/test-worker.sh
+bun test                       # unit tests: local D1 + R2 via wrangler's getPlatformProxy
+bash scripts/test-worker.sh    # end-to-end: wrangler dev with local D1 + R2
 ```
 
-The script builds `dist-worker/`, migrates the database, starts `wrangler dev` with Hyperdrive pointed at it (`CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE`) and checks: `/healthz`, admin login, creating and listing skills, profile and client creation, MCP `initialize`/`tools/list` (2025-06-18) and `server/discover`/`tools/list` (2026-07-28) with a client key, `skillbox publish` from `cli/skillbox.mjs`, downloads of `bootstrap/SKILL.md`, `cli/skillbox.mjs` and the web assets, Executor and AI-gateway settings (encrypted storage), and 30 concurrent requests. It fails if the runtime log shows an uncaught error. `scripts/test-worker.ts` alone also runs against a Bun server (`SKILLBOX_URL=http://127.0.0.1:4791`).
+`scripts/test-worker.sh` builds the assets, applies the migrations to a throwaway state directory, starts `wrangler dev` on it and checks: `/healthz`, admin login, creating and listing skills, profile and client creation, MCP `initialize`/`tools/list` (2025-06-18 and 2026-07-28), `load_skill` and `read_skill_file`, `skillbox publish` from `cli/skillbox.mjs`, bundle download, a 1.5 MB file round-trip byte for byte, a 50-file skill, two parallel publishes on one expected revision (one 409), restoring an old revision, search by a Russian word and by part of an ID, downloads of `bootstrap/SKILL.md`, `cli/skillbox.mjs` and the web assets, encrypted Executor and provider settings, and 30 concurrent requests. It fails if the runtime log shows an uncaught error.
 
-For interactive development: `cp wrangler.example.toml wrangler.toml`, set `localConnectionString`, put `SKILLBOX_ADMIN_TOKEN=...` into `.dev.vars`, `bun run build:worker && bun run dev:worker`.
+## Limits that touch this code
 
-## Workers limits that touch this code
+D1/R2/Workers limits below are Cloudflare's published values as known when this was written; check the current limits pages. **Workers Paid is the realistic plan.**
 
-Values below are Cloudflare's published limits as known at the time of writing; check the current [limits page](https://developers.cloudflare.com/workers/platform/limits/) for your plan. **The Workers Paid plan is the realistic target**; the Free plan breaks publishing larger skills and GitHub import.
-
-- **Request body.** The app caps bodies at 12 MB (`bodyLimit`), same as Bun's `maxRequestBodySize`. The CLI sends files base64 in JSON with a 2 MB-per-file limit (≈2.7 MB encoded); the MCP schema allows 3,000,000 characters per file. Workers accept far larger bodies (100 MB on Free/Pro), so the app's own limit is the binding one.
-- **CPU time.** Free: 10 ms per request. Publishing decodes base64, hashes every file (SHA-256), parses front matter and validates with zod — a multi-megabyte publish does not fit in 10 ms. Paid: 30 s by default. Full-text search (`to_tsvector` GIN index), grant expansion and bundle resolution run in PostgreSQL and cost the Worker only I/O wait, which is not CPU time.
-- **Subrequests.** Free: 50 per request; Paid: much higher. GitHub import fetches the tree plus one request per file (up to 400 files), four at a time — on Free, imports of more than roughly 45 files fail. Postgres traffic goes over one Hyperdrive connection per request and is not a per-query subrequest.
-- **Simultaneous connections.** 6 open connections per request. The per-request client is capped at `max: 5`; GitHub import uses 4 parallel downloads plus the database, so it stays within the limit (excess connections queue, not fail).
-- **Memory.** 128 MB per isolate. A 12 MB JSON body is held as text, parsed and decoded to buffers — several copies, still well under the limit.
-- **Script size.** The bundle is about 2.5 MB, 0.5 MB gzipped (`wrangler deploy --dry-run`), under the Free 3 MB compressed limit.
-- **Per-isolate state.** The login limiter, the GitHub-import concurrency guard (2 concurrent / 12 per minute), the Executor catalog cache (60 s) and the Executor serialization queue are module variables. In Bun they are global for the instance; on Workers they are per isolate, so the limits are weaker and Executor setting changes are not serialized across isolates. Use the WAF rule above for login.
-- **`run_worker_first = true`.** Every request, including `/assets/*`, runs the Worker so that the same security headers, SPA fallback and routing apply as in Bun. Asset requests therefore count as Worker requests.
+- **D1 row ≤ 2 MB.** File bytes are in R2. What remains per skill: `search_text` (title, description, tags and all `.md` files, **cut at 500,000 characters** — text beyond that is not searchable), the revision manifest (≈ 300 bytes per file, ~110 KB for 400 files with long paths), metadata (icons ≤ 32 KB).
+- **D1 SQL statement ≤ 100 KB, ≤ 100 bound parameters.** Every value goes as a bound parameter, never inlined, so statements stay short; ID lists use one `json_each` parameter. Large values (`search_text`, manifests) are bound parameters, which D1 documents separately from statement length. Verified locally (Miniflare) with a 1 MB markdown file and a 400-file skill; not verified on production D1.
+- **Request body.** The app caps bodies at 12 MB; a skill is ≤ 8 MB, ≤ 2 MB per file, base64 in JSON. Workers accept more.
+- **Subrequests per request** (Free 50; Paid much higher). R2 and D1 binding calls count. Publishing does one `head` (and a `put` if missing) per distinct file — a 400-file publish is up to 800 R2 operations; a bundle download or a restore reads every file; a GitHub import fetches one URL per file. On Free these break beyond roughly 20–45 files. Load, `read_skill_file` and MCP resource reads touch one or two objects; MCP `skills/list` reads one `SKILL.md` per entry on the page (25).
+- **D1 queries per request** (Free 50, Paid 1000). A publish is about six queries plus one batch; listing is three or four.
+- **Simultaneous connections: 6.** R2 reads and writes run at most six at a time.
+- **CPU time** (Free 10 ms). Publishing decodes base64, hashes every file and parses front matter; R2 integrity re-checks on read hash the bytes again. Multi-megabyte publishes and bundle downloads do not fit in 10 ms.
+- **Memory: 128 MB.** A bundle download holds every file of the revision base64-encoded (≤ 8 MB raw → ~11 MB, plus the JSON) — fine; do not raise the package limits without streaming.
+- **Bundle size.** ≈ 2.4 MB, 0.45 MB gzipped (`wrangler deploy --dry-run`), under the Free 3 MB limit.
+- **Per-isolate state.** Login limiter, GitHub-import concurrency guard, Executor catalog cache/queue and the recommendation cache are module variables: per isolate on Workers.
+- **Consistency.** D1 runs one writer; conditional batches give the old 409 semantics. Concurrent graph changes (bundle edits, archiving, replacements) conflict with each other more often than under the old global lock-and-wait: a loser gets 409 and retries instead of waiting.

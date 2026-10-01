@@ -100,7 +100,9 @@ Self\-hosted, versioned skills library for AI agents\. MCP, scoped clients, and 
 
 # Skillbox
 
-A self-hosted, versioned skills library for AI agents. React, Bun, Hono and PostgreSQL. MIT licensed.
+A self-hosted, versioned skills library for AI agents. React and Hono on Cloudflare Workers, with D1 for metadata and R2 for files. MIT licensed.
+
+> This fork (Not-Real-Studio/skillbox, branch `d1`) runs only on Cloudflare. The upstream Bun/Docker/PostgreSQL runtime was removed; upstream changes are ported by hand. Existing instances move over with `scripts/import-from-skillbox.ts`.
 
 ## Features
 
@@ -112,48 +114,35 @@ A self-hosted, versioned skills library for AI agents. React, Bun, Hono and Post
 - Optional task-aware Jev recommendations using **your own OpenRouter, TypeSafe AI or Vercel AI Gateway key**.
 - Optional Executor integration using **your own endpoint and authentication**.
 - Public GitHub URL imports with commit-pinned previews and revision conflict checks.
-- Native folder imports/exports, protected PostgreSQL/config backups and explicit restore tooling.
-- Docker-only setup, optional Caddy HTTPS and Umbrel package generation.
+- Full-history import from any skillbox instance (including upstream PostgreSQL ones).
+- One Cloudflare Worker: Static Assets, D1, R2. No servers or databases to run.
 
 A new instance starts empty. No personal skills, accounts, client keys, service endpoints or paid-provider credentials are seeded. Skillbox never executes uploaded skill code.
 
 ## Quick start
 
-Requires Docker Engine/Desktop with Compose v2 and Bash (Linux, macOS or WSL). No host Bun/Node installation needed.
+Requires a Cloudflare account and Bun. Full steps, limits and design notes: [docs/cloudflare.md](docs/cloudflare.md).
 
 ```sh
-git clone https://github.com/kitze/skillbox.git
-cd skillbox
-bash scripts/skillbox.sh setup
-# Creates .env with unique random credentials, mode 0600; refuses to overwrite.
-bash scripts/skillbox.sh start
-```
-
-Already have Bun? `bun scripts/setup-env.ts` remains available. See [self-hosting](docs/self-hosting.md) for LAN ports, optional automatic HTTPS, prebuilt images, mounted secrets, backup/restore and upgrades. [Umbrel packaging](deploy/umbrel/README.md) supports official submissions and community stores; public images and real Umbrel lifecycle verification are release gates, not implied by having package files.
-
-Open `http://127.0.0.1:4791`. Sign in with `SKILLBOX_ADMIN_TOKEN` from your local `.env`. The key is not printed by the setup script. Keep `.env` private. For a remote installation, set `SKILLBOX_ORIGIN` to your own HTTPS origin and configure a TLS reverse proxy; see [deployment](docs/deployment.md).
-
-Create or import skills, create a profile with the required grants, then create a client connection. Client keys are shown once; only their hashes are stored. Use separate client keys rather than distributing the owner key.
-
-For local development with your own PostgreSQL 16+ database:
-
-```sh
+git clone https://github.com/Not-Real-Studio/skillbox.git && cd skillbox && git checkout d1
 bun install --frozen-lockfile
-# Set DATABASE_URL, SKILLBOX_ADMIN_TOKEN (at least 32 random characters),
-# and SKILLBOX_ORIGIN=http://127.0.0.1:4791 in your protected environment.
-bun run build
-bun run start
+cp wrangler.example.toml wrangler.toml
+bunx wrangler d1 create skillbox            # paste database_id into wrangler.toml
+bunx wrangler r2 bucket create skillbox-files
+openssl rand -base64 48 | bunx wrangler secret put SKILLBOX_ADMIN_TOKEN
+# set SKILLBOX_ORIGIN in wrangler.toml to your HTTPS origin, then:
+bun run deploy                              # build, apply D1 migrations, deploy
 ```
 
-## Cloudflare Workers
+Open your origin and sign in with `SKILLBOX_ADMIN_TOKEN`. Create or import skills, create a profile with the required grants, then create a client connection. Client keys are shown once; only their hashes are stored. Use separate client keys rather than distributing the owner key.
 
-The same build also runs as a Cloudflare Worker: `bun run build:worker && bun run deploy:worker`, with static files as Workers Static Assets and your PostgreSQL behind Hyperdrive (create it with caching disabled). The schema is migrated by `bun run migrate` at deploy time, not by the Worker. Plan for Workers Paid: the Free plan's 10 ms CPU and 50 subrequests per request break larger publishes and GitHub imports. Setup, limits and the repeatable local check (`scripts/test-worker.sh`) are in [docs/cloudflare.md](docs/cloudflare.md).
+Local development needs nothing in Cloudflare: `bun run migrate:local`, put `SKILLBOX_ADMIN_TOKEN=...` (32+ characters) into `.dev.vars`, then `bun run build:worker && bun run dev` (`wrangler dev` with local D1 and R2).
 
 ## Jev setup
 
 Open **Settings → Jev recommendations**, select **Vercel AI Gateway** (default), **TypeSafe AI**, or **OpenRouter**, and save that provider's API key. Keys are stored separately: switching providers never sends another provider's key, and switching back retains its saved key. Removing the selected provider's key disables its model calls. Skillbox does not auto-import environment keys, fetch credentials from a skill library, or ship an application-wide provider account.
 
-The key is encrypted server-side in PostgreSQL using AES-256-GCM with key material derived from your `SKILLBOX_ADMIN_TOKEN`. It is never returned by the settings API or included in browser bundles. Protect the owner token and database backups. Changing that token makes stored integration credentials unreadable. Follow the [rotation guidance](docs/deployment.md) before changing it.
+The key is encrypted server-side in D1 using AES-256-GCM with key material derived from your `SKILLBOX_ADMIN_TOKEN`. It is never returned by the settings API or included in browser bundles. Protect the owner token and database backups. Changing that token makes stored integration credentials unreadable. Rotating it means reconnecting integrations afterwards.
 
 Saving a key does not validate provider access or buy credits. Jev sends task text and authorized active skill descriptions to the selected provider; its charges and data handling apply to your account. Without that provider's saved key, or on failure, recommendations return deterministic search with an explicit fallback reason and attempted `provider`.
 
@@ -222,7 +211,7 @@ MCP: `recommend_skills({task, limit?, offset?})`. HTTP: `POST /api/skill-recomme
 - Full authorized, enabled, non-archived leaf catalog is considered without lexical prefiltering. Maximum 200 leaves / 120,000 serialized characters; larger catalogs explicitly fall back rather than ranking a hidden subset.
 - Results return `id`, immutable `referenceId`, pinned `revision`, `description`, `relevance`, `method`, `noMatch`, `hasMore`, `nextOffset`, `cacheHit` and `rubricVersion`.
 - Relevance is an **uncalibrated 0–4 rubric score**, not probability. Scores ≥3 are returned, descending by score then ID. `noMatch=true` means no evaluated candidate met that threshold.
-- Missing key, eight-second deadline, provider errors, malformed responses, rate limits or capacity limits use existing PostgreSQL search. Fallback responses have `method=search`, `relevance=null`, `noMatch=null`, and `fallbackReason`; empty lexical results are not claimed as a semantic no-match.
+- Missing key, eight-second deadline, provider errors, malformed responses, rate limits or capacity limits use the built-in full-text search. Fallback responses have `method=search`, `relevance=null`, `noMatch=null`, and `fallbackReason`; empty lexical results are not claimed as a semantic no-match.
 - Process-local cache: task, authenticated scope, catalog descriptions/revisions, provider-settings revision and model/rubric version. Maximum 128 entries, five-minute TTL. Two concurrent evaluations; ten uncached requests per scope/minute. No automatic retries.
 - Grants, lifecycle and revisions are checked before model calls and re-read afterward, including cache hits. Key replacement/removal resets model/cache state. Stale results are discarded. Tasks and descriptions are evidence, not executable instructions.
 
@@ -236,30 +225,28 @@ Preview downloads and validates the package without publishing. Review `SKILL.md
 
 Publication downloads the previewed commit again, validates Git blob hashes, and records repository, full commit SHA and directory on the immutable revision. Package bytes and executable flags are preserved; no scripts run. Owner-only endpoints: `POST /api/imports/github/preview` (`url`, optional repository-relative `path`) and `POST /api/imports/github/publish` (`url` from the preview, `id`, `expectedRevision`).
 
-Public repositories only: no GitHub token, private repositories, redirects, symlinks, submodules or Git LFS. Limits: 400 files, 2 MB per file, 8 MB per package, 30-second deadline, two active imports and 12 attempts/minute per instance. Truncated or oversized repository trees fail closed. Runtime artifacts and `.env*` files are excluded; recognizable embedded secrets block import. Secret detection is heuristic, not a guarantee that imported content is safe.
+Public repositories only: no GitHub token, private repositories, redirects, symlinks, submodules or Git LFS. Limits: 400 files, 2 MB per file, 8 MB per package, 30-second deadline, two active imports and 12 attempts/minute per Worker isolate. Truncated or oversized repository trees fail closed. Runtime artifacts and `.env*` files are excluded; recognizable embedded secrets block import. Secret detection is heuristic, not a guarantee that imported content is safe.
 
 ## Data portability
 
 ```sh
-bun scripts/import.ts /path/to/skills
-SKILLBOX_EXPORT_DIR=/path/to/empty-export bun scripts/export.ts
-bash scripts/backup.sh
+SKILLBOX_SOURCE_URL=https://old.example.com SKILLBOX_SOURCE_TOKEN=<old owner token> \
+SKILLBOX_TARGET_URL=https://new.example.com SKILLBOX_TARGET_TOKEN=<new owner token> \
+bun scripts/import-from-skillbox.ts          # --save <dir> / --from <dir> for an offline copy
+bun scripts/verify-import.ts                 # same variables: compares both instances
 ```
 
-The database is the source of truth; folder exports do not change it until republished. Imports preserve file bytes and unknown frontmatter, skip runtime artifacts/symlinks, and quarantine recognizable secret patterns. This is a heuristic, not a comprehensive secret audit. Do not put passwords or tokens in skill packages.
-
-Exports contain **your skill content** and may be private. Keep exports and backups separate from public application source. An optional `scripts/export-github.sh` requires an explicit dedicated private export checkout; it is not enabled automatically.
+The importer copies every skill and bundle with its full history from any skillbox instance — upstream Bun/PostgreSQL ones included — keeping revision IDs, reference IDs, authors, messages, times and GitHub provenance. File digests are checked on both ends; re-running resumes. Profiles, clients, proposals, usage events and provider settings are not copied. Exports contain **your skill content** and may be private.
 
 ## Verification and security
 
 ```sh
 bun run typecheck
-bash scripts/test-isolated.sh
+bun test                  # unit tests on local D1 + R2 (Miniflare)
+bash scripts/test-worker.sh   # end-to-end against wrangler dev with local D1 + R2
 ```
 
-The isolated suite creates and removes its own Compose PostgreSQL instance without published ports. It covers authorization, revisions, API/MCP behavior, CLI, encrypted settings and recommendations; image creation also builds the frontend. Never run database tests against production.
-
-See [SECURITY.md](SECURITY.md), [deployment notes](docs/deployment.md), and [release checklist](docs/open-source-readiness.md). Skillbox is a single-owner, self-hosted application with scoped clients—not a public multi-tenant SaaS. No analytics, hosted account, preloaded catalog or automatic paid-provider connection is required.
+See [SECURITY.md](SECURITY.md), [Cloudflare notes](docs/cloudflare.md), and [release checklist](docs/open-source-readiness.md). Skillbox is a single-owner, self-hosted application with scoped clients—not a public multi-tenant SaaS. No analytics, hosted account, preloaded catalog or automatic paid-provider connection is required.
 
 <!-- readme-sync:footer:start -->
 <hr>

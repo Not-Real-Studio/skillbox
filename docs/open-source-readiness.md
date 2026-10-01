@@ -8,7 +8,7 @@
 - Optional Jev requires an owner-saved TypeSafe AI or Vercel AI Gateway key in Settings, with separate credentials per provider. Optional Executor requires an owner-configured endpoint and authentication.
 - Saved integration secrets use authenticated encryption and are never returned by status APIs.
 - The setup helper generates unique credentials, writes mode 0600, prints no values and refuses to overwrite an existing environment.
-- Docker build inputs are allowlisted. Local data, backups, environment files, agent logs and operational notes are excluded from build stages and the final image.
+- The Worker bundle contains only `src/` code; Static Assets contain only the web build, `bootstrap/` and `cli/`. Local state (`.wrangler/`, `.dev.vars`), exports and agent logs are git-ignored.
 - Personal curation/migration tooling and deployment inventories do not belong in the reusable source distribution. Private skill libraries and database exports remain separate.
 
 ## Before making any repository public

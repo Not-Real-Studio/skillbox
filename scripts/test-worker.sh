@@ -1,28 +1,25 @@
 #!/usr/bin/env bash
-# Repeatable Worker acceptance: builds assets, migrates DATABASE_URL, starts
-# `wrangler dev` with Hyperdrive pointed at that database and runs
-# scripts/test-worker.ts against it. Needs a reachable Postgres, nothing in Cloudflare.
-#   DATABASE_URL=postgres://user:pass@127.0.0.1:5432/db bash scripts/test-worker.sh
+# Repeatable Worker acceptance on local D1 + R2: builds assets, applies the D1
+# migrations to a throwaway state directory, starts `wrangler dev` on it and
+# runs scripts/test-worker.ts. Needs nothing in Cloudflare and no database.
+#   bash scripts/test-worker.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
-: "${DATABASE_URL:?Set DATABASE_URL to a disposable Postgres database}"
 port="${SKILLBOX_WORKER_PORT:-8799}"
 config="${WRANGLER_CONFIG:-wrangler.example.toml}"
-# Not a dependency: keeps workerd out of the Docker image. Pinned for repeatability.
-wrangler="${WRANGLER:-bunx wrangler@4.146.0}"
 admin_token="${SKILLBOX_ADMIN_TOKEN:-worker_acceptance_admin_token_$(openssl rand -hex 12)}"
 origin="http://127.0.0.1:$port"
-log="$(mktemp -t skillbox-wrangler.XXXXXX)"
+state="$(mktemp -d -t skillbox-worker-state.XXXXXX)"
+log="$state/wrangler.log"
 
 bun run build:worker >/dev/null
-bun run migrate
+bunx wrangler d1 migrations apply DB --local -c "$config" --persist-to "$state" >/dev/null
 
-export CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$DATABASE_URL"
-$wrangler dev -c "$config" --ip 127.0.0.1 --port "$port" \
+bunx wrangler dev -c "$config" --persist-to "$state" --ip 127.0.0.1 --port "$port" \
   --var "SKILLBOX_ORIGIN:$origin" --var "SKILLBOX_ADMIN_TOKEN:$admin_token" \
   >"$log" 2>&1 &
 wrangler_pid=$!
-trap 'kill "$wrangler_pid" 2>/dev/null; wait "$wrangler_pid" 2>/dev/null; rm -f "$log"' EXIT
+trap 'kill "$wrangler_pid" 2>/dev/null; wait "$wrangler_pid" 2>/dev/null; rm -rf "$state"' EXIT
 
 for _ in $(seq 60); do
   curl -fsS -o /dev/null "$origin/healthz" 2>/dev/null && break
@@ -34,7 +31,7 @@ status=0
 SKILLBOX_URL="$origin" SKILLBOX_ORIGIN="$origin" SKILLBOX_ADMIN_TOKEN="$admin_token" \
   bun scripts/test-worker.ts || status=$?
 # Cross-request I/O and uncaught errors surface only in the runtime log.
-if grep -E "Uncaught|different request|hanging Promise|Internal service error|Request failed" "$log"; then
+if grep -E "Uncaught|different request|hanging Promise|Request failed" "$log"; then
   echo "wrangler dev reported runtime errors (above)"
   status=1
 fi

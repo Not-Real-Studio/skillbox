@@ -8,6 +8,8 @@ cd "$(dirname "$0")/.."
 : "${DATABASE_URL:?Set DATABASE_URL to a disposable Postgres database}"
 port="${SKILLBOX_WORKER_PORT:-8799}"
 config="${WRANGLER_CONFIG:-wrangler.example.toml}"
+# Not a dependency: keeps workerd out of the Docker image. Pinned for repeatability.
+wrangler="${WRANGLER:-bunx wrangler@4.146.0}"
 admin_token="${SKILLBOX_ADMIN_TOKEN:-worker_acceptance_admin_token_$(openssl rand -hex 12)}"
 origin="http://127.0.0.1:$port"
 log="$(mktemp -t skillbox-wrangler.XXXXXX)"
@@ -16,7 +18,7 @@ bun run build:worker >/dev/null
 bun run migrate
 
 export CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$DATABASE_URL"
-bunx wrangler dev -c "$config" --ip 127.0.0.1 --port "$port" \
+$wrangler dev -c "$config" --ip 127.0.0.1 --port "$port" \
   --var "SKILLBOX_ORIGIN:$origin" --var "SKILLBOX_ADMIN_TOKEN:$admin_token" \
   >"$log" 2>&1 &
 wrangler_pid=$!

@@ -1,12 +1,40 @@
 import { packageMetrics } from "../package-metrics";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import * as schema from "./schema";
-export const connection = postgres(
-  process.env.DATABASE_URL ?? "postgres://localhost/skillbox",
-  { max: 8, onnotice: () => {} },
-);
-export const db = drizzle(connection, { schema });
+export function openDatabase(url: string, options: postgres.Options<{}> = {}) {
+  const sql = postgres(url, { onnotice: () => {}, ...options });
+  return { sql, db: drizzle(sql, { schema }) };
+}
+type Database = ReturnType<typeof openDatabase>;
+// Workers forbid sharing I/O objects between requests: the Worker entry opens a
+// client per request and runs the request inside withDatabase(). Bun has no
+// scope and keeps one lazily created pool per process.
+const scope = new AsyncLocalStorage<Database>();
+let processDatabase: Database | undefined;
+const current = () =>
+  scope.getStore() ??
+  (processDatabase ??= openDatabase(
+    process.env.DATABASE_URL ?? "postgres://localhost/skillbox",
+    { max: 8 },
+  ));
+export const withDatabase = <T>(database: Database, fn: () => T) =>
+  scope.run(database, fn);
+function delegate<T extends object>(target: () => T): T {
+  const forward = (prop: PropertyKey) => {
+    const value = Reflect.get(target(), prop);
+    return typeof value === "function" ? value.bind(target()) : value;
+  };
+  return new Proxy(function () {} as unknown as T, {
+    apply: (_, self, args) => Reflect.apply(target() as any, self, args),
+    get: (_, prop) => forward(prop),
+    has: (_, prop) => Reflect.has(target(), prop),
+  });
+}
+export const connection = delegate(() => current().sql);
+export const db = delegate(() => current().db);
 export async function migrate() {
   await connection`CREATE TABLE IF NOT EXISTS skills (id text PRIMARY KEY,title text NOT NULL,description text NOT NULL,tags jsonb NOT NULL DEFAULT '[]',revision text NOT NULL,search_text text NOT NULL,updated_at timestamptz NOT NULL DEFAULT now())`;
   await connection`ALTER TABLE skills ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'skill', ADD COLUMN IF NOT EXISTS members jsonb NOT NULL DEFAULT '[]', ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false, ADD COLUMN IF NOT EXISTS replacement text`;
@@ -33,9 +61,10 @@ export async function migrate() {
       const grants = [...c.skill_ids].sort();
       const id =
         "legacy-" +
-        Bun.hash(JSON.stringify([c.all_skills, grants, permissions])).toString(
-          16,
-        );
+        createHash("sha256")
+          .update(JSON.stringify([c.all_skills, grants, permissions]))
+          .digest("hex")
+          .slice(0, 16);
       const name = c.all_skills
         ? c.role === "writer"
           ? "Library editors"

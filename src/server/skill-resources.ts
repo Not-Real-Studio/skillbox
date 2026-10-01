@@ -1,5 +1,6 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "./db";
+import { withContent } from "./files";
 import { skills, revisions } from "./schema";
 import * as library from "./library";
 import type { Principal } from "../shared";
@@ -12,7 +13,7 @@ import {
 const PAGE_SIZE = 25;
 const unavailable = () => new library.Problem(404, "Skill resource not found");
 
-async function activeRevision(p: Principal, id: string) {
+async function activeRevision(p: Principal, id: string, extra: string[] = []) {
   id = await library.resolveReferenceId(id);
   if (!(await library.canRead(p, id))) throw unavailable();
   // One statement captures lifecycle, identity and bytes from the same database
@@ -33,7 +34,18 @@ async function activeRevision(p: Principal, id: string) {
       ),
     );
   if (!snapshot) throw unavailable();
-  return snapshot;
+  // SKILL.md bytes come from R2 (content-addressed, so the manifest pins them).
+  return {
+    ...snapshot,
+    revision: {
+      ...snapshot.revision,
+      files: await withContent(
+        snapshot.revision.files,
+        ["SKILL.md", ...extra],
+        true,
+      ),
+    },
+  };
 }
 
 export async function manifestFor(p: Principal, id: string) {
@@ -64,7 +76,7 @@ export async function manifestPage(p: Principal, cursor?: string) {
   const grant =
     p.role === "admin" || p.allSkills
       ? undefined
-      : inArray(skills.id, await library.authorizedIds(p));
+      : library.inList(skills.id, await library.authorizedIds(p));
   const rows = await db
     .select({ skill: skills, revision: revisions })
     .from(skills)
@@ -83,11 +95,17 @@ export async function manifestPage(p: Principal, cursor?: string) {
     .orderBy(skills.id)
     .limit(PAGE_SIZE + 1)
     .offset(offset);
-  const entries = rows.slice(0, PAGE_SIZE).flatMap(({ skill, revision }) => {
+  const page = await Promise.all(
+    rows.slice(0, PAGE_SIZE).map(async ({ skill, revision }) => ({
+      skill,
+      files: await withContent(revision.files, ["SKILL.md"], true),
+    })),
+  );
+  const entries = page.flatMap(({ skill, files }) => {
     const { manifest } = inspectSkillPackage(
       skill.referenceId,
       skill.id,
-      revision.files,
+      files,
     );
     return manifest ? [manifest] : [];
   });
@@ -120,7 +138,9 @@ export async function readResource(p: Principal, uri: string) {
   } catch {
     throw unavailable();
   }
-  const { skill, revision } = await activeRevision(p, address.referenceId);
+  const { skill, revision } = await activeRevision(p, address.referenceId, [
+    address.path,
+  ]);
   if (skill.id !== address.name) throw unavailable();
   const result = inspectSkillPackage(
     skill.referenceId,
@@ -130,7 +150,10 @@ export async function readResource(p: Principal, uri: string) {
   if (!result.manifest) throw unavailable();
   const file = revision.files.find((entry) => entry.path === address.path);
   if (!file) throw unavailable();
-  const content = resourceContent(uri, file);
+  const content = resourceContent(
+    uri,
+    file as typeof file & { content: string },
+  );
   // A resource read is not activation or execution. Reuse read_file, not load.
   await library.record(p, "read_file", skill.id, {
     revision: revision.id,
@@ -153,7 +176,7 @@ export async function compatibilityPage(p: Principal, offset = 0) {
     const { compatible, issues } = inspectSkillPackage(
       item.referenceId!,
       item.id,
-      revision.files,
+      await withContent(revision.files, ["SKILL.md"], true),
     );
     items.push({
       id: item.id,

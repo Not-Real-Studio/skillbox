@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { connection } from "./db";
+import { d1 } from "./db";
 import { seal, open } from "./secret-storage";
 import {
   createRecommender,
@@ -8,6 +8,7 @@ import {
   EvaluationUnavailable,
 } from "./recommendations";
 import type { JevProvider } from "../shared";
+import { Problem } from "./library";
 
 const providerSchema = z.enum(["vercel", "typesafe", "openrouter"], {
   error: "Choose Vercel AI Gateway, TypeSafe AI or OpenRouter",
@@ -62,10 +63,15 @@ function decode(value?: unknown): Config {
         keys: { vercel: null, typesafe: null, openrouter: null },
       };
 }
+async function readRow() {
+  const row = await d1
+    .prepare("SELECT value FROM workspace_settings WHERE id='ai_gateway'")
+    .first<{ value: string }>();
+  return row?.value ?? null;
+}
 async function readConfig() {
-  const [row] =
-    await connection`SELECT value FROM workspace_settings WHERE id='ai_gateway'`;
-  return decode(row?.value);
+  const value = await readRow();
+  return decode(value ? JSON.parse(value) : undefined);
 }
 function status(config: Config) {
   return {
@@ -91,20 +97,34 @@ let engine:
   | undefined;
 export async function configureGateway(input: z.input<typeof gatewayInput>) {
   const update = gatewayInput.parse(input);
-  const result = await connection.begin(async (tx) => {
-    // Two owner tabs updating different providers must not overwrite each other's keys.
-    await tx`SELECT pg_advisory_xact_lock(hashtext('skillbox-provider-settings'))`;
-    const [row] =
-      await tx`SELECT value FROM workspace_settings WHERE id='ai_gateway'`;
-    const config = decode(row?.value);
+  // Two owner tabs updating different providers must not overwrite each
+  // other's keys: compare-and-swap on the stored value, retried on conflict
+  // (D1 has no advisory locks).
+  let result: ReturnType<typeof status> | undefined;
+  for (let attempt = 0; !result; attempt++) {
+    if (attempt === 5)
+      throw new Problem(409, "Settings changed concurrently. Try again.");
+    const previous = await readRow();
+    const config = decode(previous ? JSON.parse(previous) : undefined);
     // Legacy callers of /settings/ai-gateway omit provider; their keys remain Gateway-only.
     config.provider = update.provider ?? "vercel";
     if (update.apiKey !== undefined)
       config.keys[config.provider] = update.apiKey;
     config.revision = randomUUID();
-    await tx`INSERT INTO workspace_settings(id,value) VALUES ('ai_gateway',${JSON.stringify(seal(config))}::jsonb) ON CONFLICT(id) DO UPDATE SET value=excluded.value`;
-    return status(config);
-  });
+    const value = JSON.stringify(seal(config));
+    const write = previous
+      ? d1
+          .prepare(
+            "UPDATE workspace_settings SET value=? WHERE id='ai_gateway' AND value=?",
+          )
+          .bind(value, previous)
+      : d1
+          .prepare(
+            "INSERT INTO workspace_settings(id,value) VALUES ('ai_gateway',?) ON CONFLICT(id) DO NOTHING",
+          )
+          .bind(value);
+    if ((await write.run()).meta.changes) result = status(config);
+  }
   engine = undefined;
   return result;
 }

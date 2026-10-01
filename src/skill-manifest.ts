@@ -92,7 +92,9 @@ export function verifiedFileBytes(file: SkillFile) {
 export function inspectSkillPackage(
   referenceId: string,
   id: string,
-  files: SkillFile[],
+  // Files without content were verified against their digest when stored;
+  // only files with content (always SKILL.md) are re-checked here.
+  files: (Omit<SkillFile, "content"> & { content?: string })[],
 ) {
   const issues: CompatibilityIssue[] = [];
   const issue = (
@@ -116,7 +118,7 @@ export function inspectSkillPackage(
       issue("duplicate_path", file.path, "Duplicate file path.");
     paths.add(key);
     try {
-      verifiedFileBytes(file);
+      if (file.content !== undefined) verifiedFileBytes(file as SkillFile);
     } catch {
       issue(
         "integrity",
@@ -142,7 +144,7 @@ export function inspectSkillPackage(
       const text = new TextDecoder("utf-8", {
         fatal: true,
         ignoreBOM: true,
-      }).decode(verifiedFileBytes(main));
+      }).decode(verifiedFileBytes(main as SkillFile));
       if (!/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.test(text))
         throw new Error("Missing YAML header");
       const parsed: unknown = matter(text).data;

@@ -9,8 +9,10 @@ import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import { eq, desc, lt, and, sql } from "drizzle-orm";
 import { db } from "./db";
-import type { StaticFiles } from "./static-files";
-import { clients, sessions, events, profiles, skills } from "./schema";
+import { noStaticFiles, type StaticFiles } from "./static-assets";
+import { clients, sessions, events, profiles, skills, nameKey } from "./schema";
+import { asSkillFiles, withContent } from "./files";
+import { uniqueViolation } from "./access";
 import {
   authenticate,
   isAdminToken,
@@ -32,10 +34,9 @@ export const app = new Hono<{
   Variables: { principal: Principal };
   Bindings: { STATIC?: StaticFiles };
 }>();
-// Entries may pass STATIC (the Worker does); otherwise files come from disk.
-// Lazy so hono/bun, which touches Bun at import, never loads in a Worker.
+// The Worker entry passes STATIC (Workers Static Assets).
 const files = async (c: { env?: { STATIC?: StaticFiles } }) =>
-  c.env?.STATIC ?? (await import("./static-files")).diskFiles;
+  c.env?.STATIC ?? noStaticFiles;
 const required = async (c: Parameters<typeof files>[0], name: string) => {
   const text = await (await files(c)).text(name);
   if (text === null) throw new Error("Missing static file");
@@ -69,7 +70,7 @@ app.onError((e, c) => {
   return c.json({ error: "Internal service error" }, 500);
 });
 app.get("/healthz", async (c) => {
-  await db.execute("select 1");
+  await db.run(sql`select 1`);
   return c.json({ ok: true, service: "skillbox" });
 });
 app.use("/api/*", async (c, next) => {
@@ -326,7 +327,7 @@ app.get("/api/skills/:id/bundle", async (c) => {
     id: r.skillId,
     revision: r.id,
     checksum: r.checksum,
-    files: r.files,
+    files: asSkillFiles(await withContent(r.files)),
   });
 });
 app.get("/api/skills/:id/history", async (c) =>
@@ -395,7 +396,7 @@ app.post("/api/skills/:id/restore", async (c) => {
     await lib.publish(
       c.get("principal"),
       r.skillId,
-      r.files,
+      asSkillFiles(await withContent(r.files)),
       body.expectedRevision,
       "Restore " + r.id.slice(0, 8),
       undefined,
@@ -431,21 +432,25 @@ app.put("/api/profiles/:id", async (c) => {
 app.delete("/api/profiles/:id", async (c) => {
   assertAdmin(c.get("principal"));
   const id = c.req.param("id");
-  return c.json(
-    await db.transaction(async (tx) => {
-      await tx.select().from(profiles).where(eq(profiles.id, id)).for("update");
-      if (
-        (await tx.select().from(clients).where(eq(clients.profileId, id)))
-          .length
-      )
-        throw new lib.Problem(
-          409,
-          "Reassign this profile’s clients before deleting it",
-        );
-      await tx.delete(profiles).where(eq(profiles.id, id));
-      return { ok: true };
-    }),
-  );
+  // One conditional statement instead of a locked read + delete.
+  const deleted = await db
+    .delete(profiles)
+    .where(
+      and(
+        eq(profiles.id, id),
+        sql`NOT EXISTS (SELECT 1 FROM clients WHERE clients.profile_id=${id})`,
+      ),
+    )
+    .returning({ id: profiles.id });
+  if (
+    !deleted.length &&
+    (await db.select().from(clients).where(eq(clients.profileId, id))).length
+  )
+    throw new lib.Problem(
+      409,
+      "Reassign this profile’s clients before deleting it",
+    );
+  return c.json({ ok: true });
 });
 app.get("/api/clients", async (c) => {
   assertAdmin(c.get("principal"));
@@ -492,31 +497,22 @@ app.patch("/api/clients/:id", async (c) => {
       .length
   )
     throw new lib.Problem(404, "Profile not found");
-  await db.transaction(async (tx) => {
-    await tx.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtext('skillbox-client-names'))`,
-    );
-    const [current] = await tx
-      .select()
-      .from(clients)
-      .where(eq(clients.id, c.req.param("id")));
-    if (!current) throw new lib.Problem(404, "Client not found");
-    if (b.active ?? current.active) {
-      const name = b.name ?? current.name;
-      if (
-        (
-          await tx
-            .select()
-            .from(clients)
-            .where(
-              sql`lower(trim(${clients.name}))=lower(${name}) AND ${clients.active}=true AND ${clients.id}<>${current.id}`,
-            )
-        ).length
-      )
-        throw new lib.Problem(409, "An active client already has this name");
-    }
-    await tx.update(clients).set(b).where(eq(clients.id, current.id));
-  });
+  // The partial unique index on active client names replaces the advisory lock.
+  const [current] = await db
+    .select()
+    .from(clients)
+    .where(eq(clients.id, c.req.param("id")));
+  if (!current) throw new lib.Problem(404, "Client not found");
+  try {
+    await db
+      .update(clients)
+      .set({ ...b, ...(b.name ? { nameKey: nameKey(b.name) } : {}) })
+      .where(eq(clients.id, current.id));
+  } catch (e) {
+    if (uniqueViolation(e, "clients.name_key"))
+      throw new lib.Problem(409, "An active client already has this name");
+    throw e;
+  }
   return c.json({ ok: true });
 });
 app.post("/api/skills/:id/proposals", async (c) => {

@@ -15,12 +15,18 @@ run_worker_first = true
 html_handling = "none"
 not_found_handling = "none"
 
-[[hyperdrive]]
-binding = "HYPERDRIVE"
-# wrangler hyperdrive create skillbox --connection-string=... --caching-disabled
-id = "<your-hyperdrive-id>"
-# Used by `wrangler dev` only.
-localConnectionString = "postgres://skillbox:skillbox@127.0.0.1:5432/skillbox"
+# Metadata. wrangler d1 create skillbox → paste database_id.
+[[d1_databases]]
+binding = "DB"
+database_name = "skillbox"
+database_id = "<your-d1-database-id>"
+migrations_dir = "migrations"
+
+# Revision and proposal file bytes, content-addressed (files/<sha256>).
+# wrangler r2 bucket create skillbox-files
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "skillbox-files"
 
 [vars]
 SKILLBOX_ORIGIN = "https://skillbox.example.com"

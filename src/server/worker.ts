@@ -1,36 +1,28 @@
-// Cloudflare Workers entry. The Bun entry is index.ts; both serve the same app.
+// Cloudflare Workers entry — the only runtime of this fork.
 // Vars and secrets reach process.env through nodejs_compat_populate_process_env.
-// The schema is migrated at deploy time (scripts/migrate.ts), never here.
+// The schema is applied with `wrangler d1 migrations apply`, never here.
+import type { D1Database, R2Bucket } from "@cloudflare/workers-types";
 import { app } from "./app";
-import { openDatabase, withDatabase } from "./db";
+import { openPlatform, withPlatform } from "./db";
 import { assetFiles } from "./static-assets";
 
 type Env = {
   ASSETS: { fetch(input: Request | string): Promise<Response> };
-  HYPERDRIVE: { connectionString: string };
+  DB: D1Database;
+  FILES: R2Bucket;
 };
 type Context = { waitUntil(promise: Promise<unknown>): void };
 
 export default {
   async fetch(request: Request, env: Env, ctx: Context) {
     const token = process.env.SKILLBOX_ADMIN_TOKEN;
-    if (!token || token.length < 32 || !env.HYPERDRIVE)
+    if (!token || token.length < 32 || !env.DB || !env.FILES)
       return new Response(
-        "Skillbox is not configured: set the SKILLBOX_ADMIN_TOKEN secret (32+ characters) and the HYPERDRIVE binding.",
+        "Skillbox is not configured: set the SKILLBOX_ADMIN_TOKEN secret (32+ characters) and the DB (D1) and FILES (R2) bindings.",
         { status: 503 },
       );
-    // Cloudflare's postgres-js pattern for Hyperdrive: one client per request,
-    // closed after the response; Hyperdrive keeps the pooled origin connections.
-    const database = openDatabase(env.HYPERDRIVE.connectionString, {
-      max: 5,
-      fetch_types: false,
-    });
-    try {
-      return await withDatabase(database, () =>
-        app.fetch(request, { STATIC: assetFiles(env.ASSETS) }, ctx as any),
-      );
-    } finally {
-      ctx.waitUntil(database.sql.end());
-    }
+    return withPlatform(openPlatform(env), () =>
+      app.fetch(request, { STATIC: assetFiles(env.ASSETS) }, ctx as any),
+    );
   },
 };

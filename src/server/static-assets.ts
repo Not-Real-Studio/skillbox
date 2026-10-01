@@ -1,4 +1,19 @@
-import type { StaticFiles } from "./static-files";
+import type { MiddlewareHandler } from "hono";
+
+/**
+ * Files the server hands out besides the API. Names are logical:
+ * "bootstrap/SKILL.md", "cli/<name>.mjs", and web build files such as "index.html".
+ */
+export type StaticFiles = {
+  text(name: string): Promise<string | null>;
+  /** Serves /assets/* from the web build. */
+  assets: MiddlewareHandler;
+};
+/** No assets bound (unit tests calling app.request directly). */
+export const noStaticFiles: StaticFiles = {
+  text: async () => null,
+  assets: (_, next) => next(),
+};
 
 type Assets = { fetch(input: Request | string): Promise<Response> };
 

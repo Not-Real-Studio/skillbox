@@ -7,9 +7,11 @@ import { packageMetrics } from "../package-metrics";
 import { parseSkillIcon, type SkillIcon } from "../skill-icons";
 import { createHash, randomUUID } from "node:crypto";
 import matter from "gray-matter";
-import { and, eq, desc, inArray, sql } from "drizzle-orm";
-import { db } from "./db";
+import { and, eq, desc, getTableColumns, sql, type SQL } from "drizzle-orm";
+import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
+import { d1, db } from "./db";
 import { skills, revisions, events } from "./schema";
+import { asSkillFiles, storeFiles, withContent } from "./files";
 import type {
   Principal,
   SkillFile,
@@ -34,6 +36,20 @@ export class Problem extends Error {
 }
 export const sha256 = (v: string | Buffer) =>
   createHash("sha256").update(v).digest("hex");
+/** column IN list via one JSON parameter: D1 allows at most 100 bound parameters. */
+export const inList = (column: SQLiteColumn | SQL, values: string[]) =>
+  sql`${column} IN (SELECT value FROM json_each(${JSON.stringify(values)}))`;
+// Graph checks and listings never need search_text (up to hundreds of KB per skill).
+const { searchText: _searchText, ...nodeColumns } = getTableColumns(skills);
+const graphColumns = {
+  id: skills.id,
+  kind: skills.kind,
+  members: skills.members,
+  archived: skills.archived,
+  disabled: skills.disabled,
+  replacement: skills.replacement,
+  revision: skills.revision,
+};
 export const ADMIN: Principal = {
   id: "admin",
   name: "Administrator",
@@ -190,7 +206,10 @@ export function metadata(id: string, files: SkillFile[]): SkillMetadata {
   };
 }
 export async function authorizedIds(p: Principal) {
-  return expandBundles(await db.select().from(skills), p.skillIds);
+  return expandBundles(
+    await db.select(graphColumns).from(skills),
+    p.skillIds,
+  );
 }
 export async function canRead(p: Principal, id: string) {
   if (p.role === "admin") return true;
@@ -208,7 +227,7 @@ export async function canRead(p: Principal, id: string) {
 const grantFilter = async (p: Principal) => {
   if (p.allSkills) return sql`true`;
   const ids = await authorizedIds(p);
-  return ids.length ? inArray(skills.id, ids) : sql`false`;
+  return ids.length ? inList(skills.id, ids) : sql`false`;
 };
 export async function record(
   p: Principal,
@@ -229,6 +248,7 @@ export async function record(
     skillId,
   });
 }
+const agentRead = sql`e.operation IN ('load','read_file','bundle') AND e.context->>'source' IN ('mcp','cli')`;
 export async function search(
   p: Principal,
   query = "",
@@ -243,22 +263,29 @@ export async function search(
   const count = Math.min(limit ?? (query ? 20 : 500), 500);
   offset = Math.max(offset, 0);
   const conditions = [await grantFilter(p)];
-  conditions.push(kinds.length ? inArray(skills.kind, kinds) : sql`false`);
+  conditions.push(kinds.length ? inList(skills.kind, kinds) : sql`false`);
   if (!(includeArchived && p.role === "admin"))
     conditions.push(eq(skills.archived, false));
   if (!(includeDisabled && p.role === "admin"))
     conditions.push(eq(skills.disabled, false));
+  // FTS5 (skills_fts): every word must match, as a prefix — unicode61 has no
+  // stemming outside English, so "навык" also finds "навыки". Plus substring
+  // match on id and description, like the former ILIKE.
+  const words = query.match(/[\p{L}\p{N}]+/gu)?.slice(0, 32) ?? [];
+  const fts = words.length ? words.map((w) => `"${w}"*`).join(" ") : null;
+  const like = "%" + query.replace(/[!%_]/g, (c) => "!" + c) + "%";
   if (query)
     conditions.push(
-      sql`(to_tsvector('english',${skills.searchText}) @@ websearch_to_tsquery('english',${query}) OR ${skills.id} ILIKE ${"%" + query + "%"} OR ${skills.description} ILIKE ${"%" + query + "%"})`,
+      sql`(${fts ? sql`${skills.id} IN (SELECT id FROM skills_fts WHERE skills_fts MATCH ${fts})` : sql`false`} OR ${skills.id} LIKE ${like} ESCAPE '!' OR ${skills.description} LIKE ${like} ESCAPE '!')`,
     );
   const rows = await db
-    .select()
+    .select(nodeColumns)
     .from(skills)
     .where(and(...conditions))
     .orderBy(
-      query
-        ? sql`ts_rank(to_tsvector('english',${skills.searchText}),websearch_to_tsquery('english',${query})) DESC`
+      // bm25() is lower for better matches; substring-only hits rank last.
+      fts
+        ? sql`COALESCE((SELECT bm25(skills_fts) FROM skills_fts WHERE skills_fts MATCH ${fts} AND skills_fts.id=${skills.id}), 0)`
         : skills.id,
       skills.id,
     )
@@ -268,29 +295,31 @@ export async function search(
   const page = rows.slice(0, count);
   const metrics =
     includeMetrics && p.role === "admin" && page.length
-      ? await db.execute(sql`
+      ? await db.all<Record<string, unknown>>(sql`
       SELECT s.id,s.package_metrics,
-        a.created_at AS "lastAgentReadAt", a.client_name AS "lastAgentReadBy",
-        u.created_at AS "lastUsedAt",
-        (SELECT count(*)::int FROM events e WHERE e.skill_id=s.id AND e.operation IN ('load','read_file','bundle') AND e.context->>'source' IN ('mcp','cli')) AS "readCount",
-        (SELECT count(*)::int FROM events e WHERE e.skill_id=s.id AND e.operation='reported_use') AS "usageCount"
+        (SELECT created_at FROM events e WHERE e.skill_id=s.id AND ${agentRead} ORDER BY created_at DESC LIMIT 1) AS "lastAgentReadAt",
+        (SELECT client_name FROM events e WHERE e.skill_id=s.id AND ${agentRead} ORDER BY created_at DESC LIMIT 1) AS "lastAgentReadBy",
+        (SELECT created_at FROM events e WHERE e.skill_id=s.id AND e.operation='reported_use' ORDER BY created_at DESC LIMIT 1) AS "lastUsedAt",
+        (SELECT count(*) FROM events e WHERE e.skill_id=s.id AND ${agentRead}) AS "readCount",
+        (SELECT count(*) FROM events e WHERE e.skill_id=s.id AND e.operation='reported_use') AS "usageCount"
       FROM skills s
-      LEFT JOIN LATERAL (SELECT created_at,client_name FROM events e WHERE e.skill_id=s.id AND e.operation IN ('load','read_file','bundle') AND e.context->>'source' IN ('mcp','cli') ORDER BY created_at DESC LIMIT 1) a ON true
-      LEFT JOIN LATERAL (SELECT created_at FROM events e WHERE e.skill_id=s.id AND e.operation='reported_use' ORDER BY created_at DESC LIMIT 1) u ON true
-      WHERE s.id IN (${sql.join(
-        page.map((s) => sql`${s.id}`),
-        sql`, `,
-      )})
+      WHERE ${inList(
+        sql`s.id`,
+        page.map((s) => s.id),
+      )}
     `)
       : [];
   const byId = new Map(
     metrics.map(({ package_metrics, ...m }) => [
-      m.id,
-      { ...m, ...(package_metrics as object) },
+      m.id as string,
+      {
+        ...m,
+        ...(package_metrics ? JSON.parse(package_metrics as string) : {}),
+      },
     ]),
   );
   const items: import("../shared").SkillSummary[] = page.map(
-    ({ searchText, packageMetrics: _, ...row }) => ({
+    ({ packageMetrics: _, ...row }) => ({
       ...row,
       ...byId.get(row.id),
     }),
@@ -389,7 +418,7 @@ export async function load(p: Principal, id: string, revision?: string) {
   const r = await revisionFor(p, id, revision);
   let composition;
   if (r.metadata.kind === "bundle") {
-    const nodes = await db.select().from(skills);
+    const nodes = await db.select(nodeColumns).from(skills);
     const root = nodes.find((n) => n.id === id)!;
     const graph = nodes.map((n) =>
       n.id === id
@@ -415,7 +444,7 @@ export async function load(p: Principal, id: string, revision?: string) {
       skills: resolved
         .map((child) => byId.get(child)!)
         .filter((n) => n.kind === "skill")
-        .map(({ searchText, members, packageMetrics, ...n }) => n),
+        .map(({ members, packageMetrics, ...n }) => n),
       bundles: resolved
         .map((child) => byId.get(child)!)
         .filter((n) => n.kind === "bundle")
@@ -428,10 +457,10 @@ export async function load(p: Principal, id: string, revision?: string) {
     .select({ referenceId: skills.referenceId })
     .from(skills)
     .where(eq(skills.id, id));
-  const instructions = Buffer.from(
-    r.files.find((f) => f.path === "SKILL.md")!.content,
-    "base64",
-  ).toString("utf8");
+  const [main] = await withContent(
+    r.files.filter((f) => f.path === "SKILL.md"),
+  );
+  const instructions = Buffer.from(main.content, "base64").toString("utf8");
   return {
     id,
     referenceId: current!.referenceId,
@@ -440,11 +469,8 @@ export async function load(p: Principal, id: string, revision?: string) {
     checksum: r.checksum,
     source: r.source ?? null,
     metadata: { ...r.metadata, disabled: r.metadata.disabled ?? false },
-    instructions: Buffer.from(
-      r.files.find((f) => f.path === "SKILL.md")!.content,
-      "base64",
-    ).toString("utf8"),
-    files: r.files.map(({ content, ...f }) => f),
+    instructions,
+    files: r.files.map(({ mime, ...f }) => f),
     ...(composition ? { composition } : {}),
     portability:
       "Fetch this exact revision on the execution host with skillbox fetch. Use returned directory as the base for relative references and bundled scripts. Historical absolute machine paths may need host-specific setup; fetching never installs dependencies.",
@@ -463,7 +489,8 @@ export async function readFile(
   if (!f) throw new Problem(404, "File not found");
   if (f.size > 160_000)
     throw new Problem(413, "File exceeds inline limit; fetch the bundle");
-  const bytes = Buffer.from(f.content, "base64");
+  const [stored] = await withContent([f]);
+  const bytes = Buffer.from(stored.content, "base64");
   if (bytes.includes(0))
     throw new Problem(415, "Binary file; fetch the bundle");
   await record(p, "read_file", id, { revision: r.id, path });
@@ -475,6 +502,18 @@ export async function readFile(
     ...(await referenceDetails(p, bytes.toString("utf8"))),
     sha256: f.sha256,
   };
+}
+const CHANGED =
+  "This skill changed. Reload before saving; your edit has not been overwritten.";
+const SEARCH_TEXT_LIMIT = 500_000;
+// Bumped by every publish that changes bundle edges, lifecycle or replacement.
+const graphGuard =
+  "COALESCE((SELECT value FROM workspace_settings WHERE id='library_graph'),'')=?";
+async function readGraphVersion() {
+  const row = await d1
+    .prepare("SELECT value FROM workspace_settings WHERE id='library_graph'")
+    .first<{ value: string }>();
+  return row?.value ?? "";
 }
 export function permits(
   p: Principal,
@@ -498,7 +537,10 @@ export async function publish(
   options: {
     archive?: boolean;
     source?: GitHubSource;
-    database?: Pick<typeof db, "transaction">;
+    /** Extra condition (SQL, params) the write requires; 409 with `conflict` otherwise. */
+    guard?: { condition: string; params: unknown[]; conflict: string };
+    /** Statements ending in a WHERE clause, run in the same batch only on success. */
+    also?: { sql: string; params: unknown[] }[];
   } = {},
 ) {
   if (
@@ -535,121 +577,204 @@ export async function publish(
           .map((f) => [f.path, f.sha256, f.executable]),
       ),
     );
-  await (options.database ?? db).transaction(async (tx) => {
-    // One graph lock prevents simultaneous A→B / B→A edits from each passing validation.
-    await tx.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtext('skillbox-library-graph'))`,
+  // D1 has no interactive transactions or row locks. Files go to R2 first;
+  // then one atomic batch whose first statement writes the skill row only if
+  // it still has expectedRevision (and, for graph changes, the library graph
+  // is unchanged since validation). Every later statement runs only if that
+  // first write took effect, so a conflict changes nothing.
+  const stored = await storeFiles(files);
+  const [existing] = await db
+    .select(graphColumns)
+    .from(skills)
+    .where(eq(skills.id, id));
+  if ((existing?.revision ?? null) !== expectedRevision)
+    throw new Problem(409, CHANGED);
+  if (options.archive && (!existing || existing.kind !== "skill"))
+    throw new Problem(403, "Only skills can be archived by this operation");
+  const control = {
+    kind: meta.kind,
+    members: meta.members,
+    archived: meta.archived,
+    disabled: meta.disabled,
+    replacement: meta.replacement,
+  };
+  const previous = {
+    kind: existing?.kind ?? "skill",
+    members: existing?.members ?? [],
+    archived: options.archive ? true : (existing?.archived ?? false),
+    disabled: existing?.disabled ?? false,
+    replacement: existing?.replacement ?? null,
+  };
+  if (
+    p.role !== "admin" &&
+    JSON.stringify(control) !== JSON.stringify(previous)
+  )
+    throw new Problem(
+      403,
+      "Only the owner can change bundles, disabled state, archival or replacements",
     );
-    const [existing] = await tx.select().from(skills).where(eq(skills.id, id));
-    if ((existing?.revision ?? null) !== expectedRevision)
+  // A new plain skill cannot invalidate other entries; edges, lifecycle and
+  // replacement changes can, so those are validated against a graph version.
+  const graphChange = existing
+    ? JSON.stringify(control) !==
+      JSON.stringify({
+        kind: existing.kind,
+        members: existing.members,
+        archived: existing.archived,
+        disabled: existing.disabled,
+        replacement: existing.replacement,
+      })
+    : control.kind === "bundle" || control.replacement !== null;
+  const graphVersion = graphChange ? await readGraphVersion() : null;
+  const nodes = (await db.select(graphColumns).from(skills)).filter(
+    (n) => n.id !== id,
+  );
+  const graph = [...nodes, { id, ...control }];
+  if (
+    meta.replacement &&
+    !graph.some((n) => n.id === meta.replacement && !n.archived)
+  )
+    throw new Problem(400, "Replacement must be an active skill or bundle");
+  try {
+    expandBundles(
+      graph,
+      graph
+        .filter((n) => n.kind === "bundle" && !n.archived)
+        .map((n) => n.id),
+      true,
+    );
+  } catch (e) {
+    throw new Problem(400, (e as Error).message);
+  }
+  // D1 rows are limited to 2 MB; search covers the first SEARCH_TEXT_LIMIT characters.
+  const searchText = [
+    id,
+    meta.title,
+    meta.description,
+    meta.tags.join(" "),
+    ...files
+      .filter((f) => f.path.endsWith(".md"))
+      .map((f) => Buffer.from(f.content, "base64").toString("utf8")),
+  ]
+    .join(" ")
+    .slice(0, SEARCH_TEXT_LIMIT);
+  const now = new Date().toISOString();
+  const row = [
+    meta.title,
+    JSON.stringify(meta.icon ?? null),
+    JSON.stringify(packageMetrics(files)),
+    meta.description,
+    JSON.stringify(meta.tags),
+    control.kind,
+    JSON.stringify(control.members),
+    control.archived ? 1 : 0,
+    control.disabled ? 1 : 0,
+    control.replacement,
+    revision,
+    searchText,
+    now,
+  ];
+  const guards = [
+    ...(graphChange ? [graphGuard] : []),
+    ...(options.guard ? [options.guard.condition] : []),
+  ];
+  const guardParams = [
+    ...(graphChange ? [graphVersion ?? ""] : []),
+    ...(options.guard?.params ?? []),
+  ];
+  const guardSql = guards.map((g) => ` AND ${g}`).join("");
+  const write =
+    expectedRevision === null
+      ? d1
+          .prepare(
+            `INSERT INTO skills (title,icon,package_metrics,description,tags,kind,members,archived,disabled,replacement,revision,search_text,updated_at,id,reference_id) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM skills WHERE id=?)${guardSql}`,
+          )
+          .bind(
+            ...row,
+            id,
+            importReferenceId ?? randomUUID(),
+            id,
+            ...guardParams,
+          )
+      : d1
+          .prepare(
+            `UPDATE skills SET title=?,icon=?,package_metrics=?,description=?,tags=?,kind=?,members=?,archived=?,disabled=?,replacement=?,revision=?,search_text=?,updated_at=? WHERE id=? AND revision=?${guardSql}`,
+          )
+          .bind(...row, id, expectedRevision, ...guardParams);
+  const success = "EXISTS (SELECT 1 FROM skills WHERE id=? AND revision=?)";
+  const statements = [
+    write,
+    d1
+      .prepare(
+        `INSERT INTO revisions (id,skill_id,metadata,files,source,checksum,message,author,created_at) SELECT ?,?,?,?,?,?,?,?,? WHERE ${success}`,
+      )
+      .bind(
+        revision,
+        id,
+        JSON.stringify(meta),
+        JSON.stringify(stored),
+        options.source ? JSON.stringify(options.source) : null,
+        checksum,
+        message.slice(0, 200),
+        p.name,
+        now,
+        id,
+        revision,
+      ),
+    d1
+      .prepare(
+        `INSERT INTO events (id,client_id,client_name,operation,skill_id,context,created_at) SELECT ?,?,?,'publish',?,?,? WHERE ${success}`,
+      )
+      .bind(
+        randomUUID(),
+        p.id,
+        p.name,
+        id,
+        JSON.stringify({ ...p.context, revision }),
+        now,
+        id,
+        revision,
+      ),
+  ];
+  if (!existing && p.profileId && !p.allSkills)
+    // A newly created skill belongs to the creating profile.
+    statements.push(
+      d1
+        .prepare(
+          `UPDATE profiles SET skill_ids=json_insert(skill_ids,'$[#]',?),version=? WHERE id=? AND ${success}`,
+        )
+        .bind(id, randomUUID(), p.profileId, id, revision),
+    );
+  if (graphChange)
+    statements.push(
+      d1
+        .prepare(
+          `INSERT INTO workspace_settings (id,value) SELECT 'library_graph',? WHERE ${success} ON CONFLICT(id) DO UPDATE SET value=excluded.value`,
+        )
+        .bind(randomUUID(), id, revision),
+    );
+  for (const extra of options.also ?? [])
+    statements.push(
+      d1
+        .prepare(`${extra.sql} AND ${success}`)
+        .bind(...extra.params, id, revision),
+    );
+  const [result] = await d1.batch(statements);
+  if (!result.meta.changes) {
+    if (options.guard) {
+      const check = await d1
+        .prepare(`SELECT 1 AS ok WHERE ${options.guard.condition}`)
+        .bind(...options.guard.params)
+        .first();
+      if (!check) throw new Problem(409, options.guard.conflict);
+    }
+    if (graphChange && (await readGraphVersion()) !== graphVersion)
       throw new Problem(
         409,
-        "This skill changed. Reload before saving; your edit has not been overwritten.",
+        "The library changed while saving. Reload and try again; your edit has not been saved.",
       );
-    if (options.archive && (!existing || existing.kind !== "skill"))
-      throw new Problem(403, "Only skills can be archived by this operation");
-    const control = {
-      kind: meta.kind,
-      members: meta.members,
-      archived: meta.archived,
-      disabled: meta.disabled,
-      replacement: meta.replacement,
-    };
-    const previous = {
-      kind: existing?.kind ?? "skill",
-      members: existing?.members ?? [],
-      archived: options.archive ? true : (existing?.archived ?? false),
-      disabled: existing?.disabled ?? false,
-      replacement: existing?.replacement ?? null,
-    };
-    if (
-      p.role !== "admin" &&
-      JSON.stringify(control) !== JSON.stringify(previous)
-    )
-      throw new Problem(
-        403,
-        "Only the owner can change bundles, disabled state, archival or replacements",
-      );
-    const nodes = (await tx.select().from(skills)).filter((n) => n.id !== id);
-    const graph = [...nodes, { id, ...control }];
-    if (
-      meta.replacement &&
-      !graph.some((n) => n.id === meta.replacement && !n.archived)
-    )
-      throw new Problem(400, "Replacement must be an active skill or bundle");
-    try {
-      expandBundles(
-        graph,
-        graph
-          .filter((n) => n.kind === "bundle" && !n.archived)
-          .map((n) => n.id),
-        true,
-      );
-    } catch (e) {
-      throw new Problem(400, (e as Error).message);
-    }
-    const searchText = [
-      id,
-      meta.title,
-      meta.description,
-      meta.tags.join(" "),
-      ...files
-        .filter((f) => f.path.endsWith(".md"))
-        .map((f) => Buffer.from(f.content, "base64").toString("utf8")),
-    ].join(" ");
-    await tx
-      .insert(skills)
-      .values({
-        id,
-        referenceId: importReferenceId,
-        ...control,
-        title: meta.title,
-        icon: meta.icon,
-        packageMetrics: packageMetrics(files),
-        description: meta.description,
-        tags: meta.tags,
-        revision,
-        searchText,
-      })
-      .onConflictDoUpdate({
-        target: skills.id,
-        set: {
-          ...control,
-          title: meta.title,
-          icon: meta.icon,
-          packageMetrics: packageMetrics(files),
-          description: meta.description,
-          tags: meta.tags,
-          revision,
-          searchText,
-          updatedAt: new Date().toISOString(),
-        },
-      });
-    if (!existing && p.profileId && !p.allSkills) {
-      // A newly created skill belongs to the creating profile.
-      await tx.execute(
-        sql`UPDATE profiles SET skill_ids=skill_ids || ${JSON.stringify([id])}::jsonb,version=gen_random_uuid()::text WHERE id=${p.profileId}`,
-      );
-    }
-    await tx.insert(revisions).values({
-      id: revision,
-      skillId: id,
-      files,
-      metadata: meta,
-      source: options.source,
-      checksum,
-      message: message.slice(0, 200),
-      author: p.name,
-    });
-    await tx.insert(events).values({
-      id: randomUUID(),
-      clientId: p.id,
-      clientName: p.name,
-      operation: "publish",
-      skillId: id,
-      context: { ...p.context, revision },
-    });
-  });
+    throw new Problem(409, CHANGED);
+  }
   return { id, revision, checksum };
 }
 export async function history(p: Principal, id: string) {
@@ -695,6 +820,9 @@ export async function saveBundle(
   const previous = expectedRevision
     ? await revisionFor(p, id, expectedRevision)
     : null;
+  const previousFiles = previous
+    ? asSkillFiles(await withContent(previous.files))
+    : [];
   const frontmatter = {
     ...(previous?.metadata.frontmatter ?? {}),
     name: id,
@@ -706,14 +834,14 @@ export async function saveBundle(
   const body = previous
     ? matter(
         Buffer.from(
-          previous.files.find((f) => f.path === "SKILL.md")!.content,
+          previousFiles.find((f) => f.path === "SKILL.md")!.content,
           "base64",
         ).toString("utf8"),
       ).content
     : `# ${title}\n\nLoad the relevant members from this bundle. Shared members appear once; instructions stay in their individual skills.\n`;
   const source = matter.stringify(body, frontmatter);
   const files = [
-    ...(previous?.files ?? []).filter((f) => f.path !== "SKILL.md"),
+    ...previousFiles.filter((f) => f.path !== "SKILL.md"),
     makeFile("SKILL.md", source),
   ];
   return publish(p, id, files, expectedRevision, "Update bundle composition");
@@ -728,7 +856,7 @@ export async function setDisabled(
   if (p.role !== "admin")
     throw new Problem(403, "Only the owner can enable or disable entries");
   const previous = await revisionFor(p, id, expectedRevision);
-  const files = previous.files.map((f) => {
+  const files = asSkillFiles(await withContent(previous.files)).map((f) => {
     if (f.path !== "SKILL.md") return f;
     const source = Buffer.from(f.content, "base64").toString("utf8");
     const body = source.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, "");
@@ -792,7 +920,7 @@ export async function setIcon(
     };
     sourceIcon = { kind: "image", src: path };
   }
-  const files = previous.files
+  const files = asSkillFiles(await withContent(previous.files))
     .filter((f) => f.path !== asset?.path)
     .map((f) => {
       if (f.path !== "SKILL.md") return f;
@@ -820,7 +948,7 @@ export async function setIntegrations(
   if (!permits(p, "update"))
     throw new Problem(403, "Update permission required");
   const r = await revisionFor(p, id, expectedRevision);
-  const files = r.files.map((f) =>
+  const files = asSkillFiles(await withContent(r.files)).map((f) =>
     f.path !== "SKILL.md"
       ? f
       : makeFile(
@@ -886,7 +1014,7 @@ async function referenceDetails(p: Principal, text: string) {
     .from(skills)
     .where(
       and(
-        inArray(skills.referenceId, ids),
+        inList(skills.referenceId, ids),
         await grantFilter(p),
         p.role === "admin" ? sql`true` : eq(skills.disabled, false),
       ),
@@ -913,7 +1041,7 @@ export async function archiveSkill(
   if (!permits(p, "delete"))
     throw new Problem(403, "Delete permission required");
   const r = await revisionFor(p, id);
-  const files = r.files.map((f) => {
+  const files = asSkillFiles(await withContent(r.files)).map((f) => {
     if (f.path !== "SKILL.md") return f;
     const parsed = matter(Buffer.from(f.content, "base64").toString("utf8"));
     return makeFile(

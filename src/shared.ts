@@ -31,6 +31,8 @@ export type SkillFile = {
   size: number;
   executable: boolean;
 };
+/** Revision manifest entry; the bytes live in R2 under files/<sha256>. */
+export type StoredFile = Omit<SkillFile, "content"> & { mime: string };
 export type SkillMetadata = {
   executorIntegrations?: string[];
   icon?: SkillIcon | null;

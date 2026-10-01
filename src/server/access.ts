@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql, desc } from "drizzle-orm";
+import { and, eq, desc } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db";
-import { profiles, clients, proposals } from "./schema";
+import { profiles, clients, proposals, nameKey } from "./schema";
+import { asSkillFiles, storeFiles, withContent } from "./files";
 import { assertAdmin, createClient } from "./auth";
 import * as lib from "./library";
 import type { Principal, SkillFile } from "../shared";
@@ -27,22 +28,13 @@ export async function saveProfile(
   assertAdmin(p);
   const body = profileSchema.parse(input);
   body.skillIds = [...new Set(body.skillIds)];
-  return db.transaction(async (tx) => {
-    await tx.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtext('skillbox-profile-names'))`,
-    );
-    const collision = await tx
-      .select()
-      .from(profiles)
-      .where(
-        sql`lower(trim(${profiles.name}))=lower(${body.name}) AND ${profiles.id}<>${id}`,
-      );
-    if (collision.length)
-      throw new lib.Problem(409, "A profile with this name already exists");
+  // The unique name_key index replaces the advisory lock; the version check
+  // is part of the UPDATE itself.
+  try {
     if (version) {
-      const rows = await tx
+      const rows = await db
         .update(profiles)
-        .set({ ...body, version: randomUUID() })
+        .set({ ...body, nameKey: nameKey(body.name), version: randomUUID() })
         .where(and(eq(profiles.id, id), eq(profiles.version, version)))
         .returning();
       if (!rows.length)
@@ -50,12 +42,16 @@ export async function saveProfile(
       return rows[0];
     }
     return (
-      await tx
+      await db
         .insert(profiles)
-        .values({ id, ...body })
+        .values({ id, ...body, nameKey: nameKey(body.name) })
         .returning()
     )[0];
-  });
+  } catch (e) {
+    if (uniqueViolation(e, "profiles.name_key"))
+      throw new lib.Problem(409, "A profile with this name already exists");
+    throw e;
+  }
 }
 export async function uniqueClient(name: string, profileId: string) {
   const [profile] = await db
@@ -63,24 +59,22 @@ export async function uniqueClient(name: string, profileId: string) {
     .from(profiles)
     .where(eq(profiles.id, profileId));
   if (!profile) throw new lib.Problem(404, "Profile not found");
-  return db.transaction(async (tx) => {
-    await tx.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtext('skillbox-client-names'))`,
-    );
-    const existing = await tx
-      .select()
-      .from(clients)
-      .where(
-        sql`lower(trim(${clients.name}))=lower(${name.trim()}) AND ${clients.active}=true`,
-      );
-    if (existing.length)
+  try {
+    return await createClient(name.trim(), "reader", false, [], profileId);
+  } catch (e) {
+    if (uniqueViolation(e, "clients.name_key"))
       throw new lib.Problem(
         409,
         "An active client already has this name. Use its existing key or give this connection a distinct name.",
       );
-    return createClient(name.trim(), "reader", false, [], profileId);
-  });
+    throw e;
+  }
 }
+/** D1 reports constraint failures only through the error message. */
+export const uniqueViolation = (e: unknown, column: string) =>
+  e instanceof Error &&
+  /UNIQUE constraint failed/.test(String(e.message) + String(e.cause ?? "")) &&
+  (String(e.message) + String(e.cause ?? "")).includes(column);
 export async function propose(
   p: Principal,
   id: string,
@@ -107,6 +101,7 @@ export async function propose(
         403,
         "Proposals can change skill content, not access or lifecycle settings",
       );
+  const stored = await storeFiles(files);
   const [row] = await db
     .insert(proposals)
     .values({
@@ -114,7 +109,7 @@ export async function propose(
       skillId: id,
       clientId: p.id,
       clientName: p.name,
-      files,
+      files: stored,
       expectedRevision,
       message,
     })
@@ -152,7 +147,11 @@ export async function proposalDetail(p: Principal, id: string) {
     proposal.skillId,
     proposal.expectedRevision,
   );
-  return { ...proposal, baseFiles: base.files };
+  return {
+    ...proposal,
+    files: asSkillFiles(await withContent(proposal.files)),
+    baseFiles: asSkillFiles(await withContent(base.files)),
+  };
 }
 export async function reviewProposal(
   p: Principal,
@@ -160,36 +159,47 @@ export async function reviewProposal(
   decision: "approve" | "reject",
 ) {
   assertAdmin(p);
-  return db.transaction(async (tx) => {
-    const [proposal] = await tx
-      .select()
-      .from(proposals)
-      .where(eq(proposals.id, id))
-      .for("update");
-    if (!proposal) throw new lib.Problem(404, "Proposal not found");
-    if (proposal.status !== "pending")
-      throw new lib.Problem(409, "Proposal already reviewed");
-    const result =
-      decision === "approve"
-        ? await lib.publish(
-            { ...p, name: `${p.name} (proposal by ${proposal.clientName})` },
-            proposal.skillId,
-            proposal.files,
-            proposal.expectedRevision,
-            proposal.message,
-            undefined,
-            { database: tx },
-          )
-        : null;
-    await tx
+  const [proposal] = await db
+    .select()
+    .from(proposals)
+    .where(eq(proposals.id, id));
+  if (!proposal) throw new lib.Problem(404, "Proposal not found");
+  if (proposal.status !== "pending")
+    throw new lib.Problem(409, "Proposal already reviewed");
+  const reviewedAt = new Date().toISOString();
+  if (decision === "reject") {
+    // Conditional on still pending: a concurrent review wins once.
+    const rows = await db
       .update(proposals)
-      .set({
-        status: decision === "approve" ? "approved" : "rejected",
-        reviewer: p.name,
-        reviewedAt: new Date().toISOString(),
-        publishedRevision: result?.revision ?? null,
-      })
-      .where(eq(proposals.id, id));
-    return { ok: true, revision: result?.revision };
-  });
+      .set({ status: "rejected", reviewer: p.name, reviewedAt })
+      .where(and(eq(proposals.id, id), eq(proposals.status, "pending")))
+      .returning({ id: proposals.id });
+    if (!rows.length) throw new lib.Problem(409, "Proposal already reviewed");
+    return { ok: true, revision: undefined };
+  }
+  // Approval publishes and marks the proposal in one batch, guarded by the
+  // proposal still being pending (replaces SELECT … FOR UPDATE).
+  const pending = {
+    condition:
+      "EXISTS (SELECT 1 FROM proposals WHERE id=? AND status='pending')",
+    params: [id],
+  };
+  const result = await lib.publish(
+    { ...p, name: `${p.name} (proposal by ${proposal.clientName})` },
+    proposal.skillId,
+    asSkillFiles(await withContent(proposal.files)),
+    proposal.expectedRevision,
+    proposal.message,
+    undefined,
+    {
+      guard: { ...pending, conflict: "Proposal already reviewed" },
+      also: [
+        {
+          sql: "UPDATE proposals SET status='approved',reviewer=?,reviewed_at=?,published_revision=(SELECT revision FROM skills WHERE id=?) WHERE id=? AND status='pending'",
+          params: [p.name, reviewedAt, proposal.skillId, id],
+        },
+      ],
+    },
+  );
+  return { ok: true, revision: result.revision };
 }

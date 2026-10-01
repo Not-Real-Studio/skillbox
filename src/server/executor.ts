@@ -7,7 +7,7 @@ import {
   auth,
   type OAuthClientProvider,
 } from "@modelcontextprotocol/sdk/client/auth.js";
-import { connection } from "./db";
+import { d1 } from "./db";
 import { Problem } from "./library";
 type Config = {
   endpoint: string;
@@ -20,12 +20,18 @@ type Config = {
   expiresAt?: number;
 };
 async function read(): Promise<Config> {
-  const [row] =
-    await connection`SELECT value FROM workspace_settings WHERE id='executor'`;
-  return row ? open(row.value) as Config : { endpoint: "" };
+  const row = await d1
+    .prepare("SELECT value FROM workspace_settings WHERE id='executor'")
+    .first<{ value: string }>();
+  return row ? (open(JSON.parse(row.value)) as Config) : { endpoint: "" };
 }
 async function save(c: Config) {
-  await connection`INSERT INTO workspace_settings(id,value) VALUES ('executor',${JSON.stringify(seal(c))}::jsonb) ON CONFLICT(id) DO UPDATE SET value=excluded.value`;
+  await d1
+    .prepare(
+      "INSERT INTO workspace_settings(id,value) VALUES ('executor',?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
+    )
+    .bind(JSON.stringify(seal(c)))
+    .run();
 }
 let queue = Promise.resolve();
 function serial<T>(f: () => Promise<T>): Promise<T> {

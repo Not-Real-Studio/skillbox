@@ -1,7 +1,7 @@
 import { timingSafeEqual, randomBytes, randomUUID } from "node:crypto";
 import { and, eq, gt } from "drizzle-orm";
 import { db } from "./db";
-import { clients, sessions, profiles } from "./schema";
+import { clients, sessions, profiles, nameKey } from "./schema";
 import { ADMIN, Problem, sha256 } from "./library";
 import type { Principal } from "../shared";
 export const token = () => randomBytes(32).toString("base64url");
@@ -76,13 +76,24 @@ export async function createClient(
 ) {
   const secret = token(),
     id = randomUUID();
-  if (!profileId) {
-    profileId = randomUUID();
-    await db
-      .insert(profiles)
-      .values({
-        id: profileId,
+  const client = db.insert(clients).values({
+    id,
+    name,
+    nameKey: nameKey(name),
+    profileId: profileId ?? id,
+    role,
+    allSkills,
+    skillIds,
+    tokenHash: sha256(secret),
+  });
+  if (profileId) await client;
+  // A legacy-style client gets its own profile; both rows land atomically.
+  else
+    await db.batch([
+      db.insert(profiles).values({
+        id,
         name,
+        nameKey: nameKey(name) + ":" + id,
         allSkills,
         skillIds,
         permissions: {
@@ -91,19 +102,9 @@ export async function createClient(
           delete: false,
           propose: false,
         },
-      });
-  }
-  await db
-    .insert(clients)
-    .values({
-      id,
-      name,
-      profileId,
-      role,
-      allSkills,
-      skillIds,
-      tokenHash: sha256(secret),
-    });
+      }),
+      client,
+    ]);
   return { id, token: secret };
 }
 export function assertAdmin(p: Principal) {

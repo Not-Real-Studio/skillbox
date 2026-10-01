@@ -15,7 +15,7 @@ export function seal(value: unknown) {
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key(), iv);
   const bytes = Buffer.concat([
-    cipher.update(JSON.stringify(value)),
+    cipher.update(JSON.stringify(value), "utf8"),
     cipher.final(),
   ]);
   return {

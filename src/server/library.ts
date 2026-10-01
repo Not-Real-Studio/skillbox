@@ -1049,3 +1049,129 @@ export async function archiveSkill(
     archive: true,
   });
 }
+
+/**
+ * Owner-only migration from another skillbox instance (scripts/import-from-skillbox.ts):
+ * stores one historical revision as-is — same revision ID, reference ID, author,
+ * message, time and provenance. Revisions arrive oldest first; each one becomes
+ * the current revision, so after the last one the skill matches the source.
+ * `previous` is the source revision before this one (null for the first), and
+ * the write is conditional on it, like expectedRevision in publish. Bundle
+ * graph checks are skipped: members may arrive later, and the source graph was
+ * already valid.
+ */
+export async function importRevision(
+  p: Principal,
+  id: string,
+  input: {
+    referenceId: string;
+    previous: string | null;
+    revision: {
+      id: string;
+      message: string;
+      author: string;
+      createdAt: string;
+      checksum: string;
+      source?: GitHubSource | null;
+    };
+    files: SkillFile[];
+  },
+) {
+  if (p.role !== "admin")
+    throw new Problem(403, "Administrator access required");
+  validId(id);
+  if (!REFERENCE_ID.test(input.referenceId))
+    throw new Problem(400, "Invalid reference ID");
+  if (
+    !REFERENCE_ID.test(input.revision.id) &&
+    !/^[\w-]{1,80}$/.test(input.revision.id)
+  )
+    throw new Problem(400, "Invalid revision ID");
+  validateFiles(input.files);
+  const meta = metadata(id, input.files);
+  const checksum = sha256(
+    JSON.stringify(
+      [...input.files]
+        .sort((a, b) => a.path.localeCompare(b.path, "en-US"))
+        .map((f) => [f.path, f.sha256, f.executable]),
+    ),
+  );
+  if (checksum !== input.revision.checksum)
+    throw new Problem(400, "Revision checksum does not match its files");
+  const [existing] = await db
+    .select({ revision: skills.revision, referenceId: skills.referenceId })
+    .from(skills)
+    .where(eq(skills.id, id));
+  // Already imported (current or older): resuming skips it.
+  const [known] = await db
+    .select({ id: revisions.id })
+    .from(revisions)
+    .where(and(eq(revisions.id, input.revision.id), eq(revisions.skillId, id)));
+  if (known) return { id, revision: input.revision.id, imported: false };
+  if ((existing?.revision ?? null) !== input.previous)
+    throw new Problem(409, "Target skill has a different history");
+  if (existing && existing.referenceId !== input.referenceId)
+    throw new Problem(409, "Target skill has a different reference ID");
+  const stored = await storeFiles(input.files);
+  const searchText = [
+    id,
+    meta.title,
+    meta.description,
+    meta.tags.join(" "),
+    ...input.files
+      .filter((f) => f.path.endsWith(".md"))
+      .map((f) => Buffer.from(f.content, "base64").toString("utf8")),
+  ]
+    .join(" ")
+    .slice(0, SEARCH_TEXT_LIMIT);
+  const row = [
+    meta.title,
+    JSON.stringify(meta.icon ?? null),
+    JSON.stringify(packageMetrics(input.files)),
+    meta.description,
+    JSON.stringify(meta.tags),
+    meta.kind,
+    JSON.stringify(meta.members),
+    meta.archived ? 1 : 0,
+    meta.disabled ? 1 : 0,
+    meta.replacement,
+    input.revision.id,
+    searchText,
+    input.revision.createdAt,
+  ];
+  const write = existing
+    ? d1
+        .prepare(
+          "UPDATE skills SET title=?,icon=?,package_metrics=?,description=?,tags=?,kind=?,members=?,archived=?,disabled=?,replacement=?,revision=?,search_text=?,updated_at=? WHERE id=? AND revision=?",
+        )
+        .bind(...row, id, input.previous)
+    : d1
+        .prepare(
+          "INSERT INTO skills (title,icon,package_metrics,description,tags,kind,members,archived,disabled,replacement,revision,search_text,updated_at,id,reference_id) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM skills WHERE id=?)",
+        )
+        .bind(...row, id, input.referenceId, id);
+  const [result] = await d1.batch([
+    write,
+    d1
+      .prepare(
+        "INSERT INTO revisions (id,skill_id,metadata,files,source,checksum,message,author,created_at) SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM skills WHERE id=? AND revision=?)",
+      )
+      .bind(
+        input.revision.id,
+        id,
+        JSON.stringify(meta),
+        JSON.stringify(stored),
+        input.revision.source ? JSON.stringify(input.revision.source) : null,
+        checksum,
+        input.revision.message.slice(0, 200),
+        input.revision.author.slice(0, 200),
+        input.revision.createdAt,
+        id,
+        input.revision.id,
+      ),
+  ]);
+  if (!result.meta.changes)
+    throw new Problem(409, "Target skill has a different history");
+  await record(p, "import", id, { revision: input.revision.id });
+  return { id, revision: input.revision.id, imported: true };
+}

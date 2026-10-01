@@ -1605,3 +1605,43 @@ test("separate create/update/delete permissions and proposals preserve revision 
     await db.delete(skills).where(inArray(skills.id, [id, other]));
   }
 });
+test("import keeps revision identity, resumes idempotently and refuses foreign history", async () => {
+  const { importRevision, sha256: digest } = await import("../src/server/library");
+  const id = "test-import-" + randomUUID().slice(0, 8);
+  const referenceId = randomUUID();
+  const revision = (n: number, body: string) => {
+    const f = files(id, body);
+    return {
+      files: f,
+      revision: {
+        id: randomUUID(),
+        message: `Source revision ${n}`,
+        author: "Old owner",
+        createdAt: new Date(Date.UTC(2025, 0, n)).toISOString(),
+        checksum: digest(JSON.stringify([...f].sort((a, b) => a.path.localeCompare(b.path, "en-US")).map((x) => [x.path, x.sha256, x.executable]))),
+      },
+    };
+  };
+  const first = revision(1, "First"),
+    second = revision(2, "Second");
+  try {
+    await expect(importRevision({ ...ADMIN, role: "writer" }, id, { referenceId, previous: null, ...first })).rejects.toMatchObject({ status: 403 });
+    expect((await importRevision(ADMIN, id, { referenceId, previous: null, ...first })).imported).toBe(true);
+    expect((await importRevision(ADMIN, id, { referenceId, previous: first.revision.id, ...second })).imported).toBe(true);
+    // Resuming from the start skips what is already there.
+    expect((await importRevision(ADMIN, id, { referenceId, previous: null, ...first })).imported).toBe(false);
+    const loaded = await load(ADMIN, id);
+    expect(loaded).toMatchObject({ referenceId, revision: second.revision.id });
+    expect(loaded.instructions).toContain("Second");
+    const history = await (await import("../src/server/library")).history(ADMIN, id);
+    expect(history.map((h) => [h.revision, h.author, h.message, h.createdAt])).toEqual([
+      [second.revision.id, "Old owner", "Source revision 2", second.revision.createdAt],
+      [first.revision.id, "Old owner", "Source revision 1", first.revision.createdAt],
+    ]);
+    await expect(importRevision(ADMIN, id, { referenceId, previous: first.revision.id, ...revision(3, "Fork") })).rejects.toMatchObject({ status: 409 });
+    await expect(importRevision(ADMIN, id, { referenceId, previous: second.revision.id, ...revision(4, "Bad"), revision: { ...revision(4, "Bad").revision, checksum: "0".repeat(64) } })).rejects.toMatchObject({ status: 400 });
+  } finally {
+    await db.delete(revisions).where(eq(revisions.skillId, id));
+    await db.delete(skills).where(eq(skills.id, id));
+  }
+});

@@ -383,6 +383,34 @@ app.put("/api/skills/:id", async (c) => {
     ),
   );
 });
+app.post("/api/import/skills/:id/revisions", async (c) => {
+  assertAdmin(c.get("principal"));
+  const body = z
+    .object({
+      referenceId: z.string(),
+      previous: z.string().nullable(),
+      revision: z.object({
+        id: z.string().max(80),
+        message: z.string().max(2000),
+        author: z.string().max(2000),
+        createdAt: z.string().datetime({ offset: true }),
+        checksum: z.string().length(64),
+        source: z.any().optional(),
+      }),
+      files: z.array(fileSchema).max(400),
+    })
+    .strict()
+    .parse(await c.req.json());
+  return c.json(
+    await lib.importRevision(c.get("principal"), c.req.param("id"), {
+      ...body,
+      revision: {
+        ...body.revision,
+        createdAt: new Date(body.revision.createdAt).toISOString(),
+      },
+    }),
+  );
+});
 app.post("/api/skills/:id/restore", async (c) => {
   const body = z
     .object({ revision: z.string(), expectedRevision: z.string() })

@@ -1,9 +1,4 @@
-import {
-  sqliteTable,
-  text,
-  integer,
-  index,
-} from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core";
 import type { SkillMetadata, GitHubSource, StoredFile } from "../shared";
 // D1/SQLite: JSON lives in text columns, timestamps are ISO-8601 strings
 // (lexicographic order = time order), UUID defaults come from the code.

@@ -84,12 +84,10 @@ export async function withContent<T extends Omit<SkillFile, "content">>(
 
 /** Strips manifest-only fields so files compare and serialize like SkillFile. */
 export const asSkillFiles = (files: (StoredFile & { content: string })[]) =>
-  files.map(
-    ({ mime, ...file }): SkillFile => ({
-      path: file.path,
-      content: file.content,
-      sha256: file.sha256,
-      size: file.size,
-      executable: file.executable,
-    }),
-  );
+  files.map(({ mime, ...file }): SkillFile => ({
+    path: file.path,
+    content: file.content,
+    sha256: file.sha256,
+    size: file.size,
+    executable: file.executable,
+  }));

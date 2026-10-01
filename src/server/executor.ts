@@ -90,7 +90,8 @@ export async function validateExecutorResource(
     advertised.hash
   )
     throw new Error("Invalid OAuth resource");
-  const compatibility = executorResourceAliases()[server.href] === advertised.href;
+  const compatibility =
+    executorResourceAliases()[server.href] === advertised.href;
   if (
     !compatibility &&
     (server.origin !== advertised.origin ||
@@ -150,7 +151,8 @@ const timedFetch = (input: string | URL | Request, init?: RequestInit) =>
 export function authorizeExecutor(code?: string, state?: string) {
   return serial(async () => {
     const c = await read();
-    if (!c.endpoint) throw new Problem(400, "Set an Executor endpoint in Settings first");
+    if (!c.endpoint)
+      throw new Problem(400, "Set an Executor endpoint in Settings first");
     if (code) {
       if (
         !state ||

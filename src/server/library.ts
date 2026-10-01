@@ -206,10 +206,7 @@ export function metadata(id: string, files: SkillFile[]): SkillMetadata {
   };
 }
 export async function authorizedIds(p: Principal) {
-  return expandBundles(
-    await db.select(graphColumns).from(skills),
-    p.skillIds,
-  );
+  return expandBundles(await db.select(graphColumns).from(skills), p.skillIds);
 }
 export async function canRead(p: Principal, id: string) {
   if (p.role === "admin") return true;
@@ -638,9 +635,7 @@ export async function publish(
   try {
     expandBundles(
       graph,
-      graph
-        .filter((n) => n.kind === "bundle" && !n.archived)
-        .map((n) => n.id),
+      graph.filter((n) => n.kind === "bundle" && !n.archived).map((n) => n.id),
       true,
     );
   } catch (e) {

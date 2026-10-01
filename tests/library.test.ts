@@ -1,7 +1,9 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { app } from "../src/server/app";
-import { migrate, db, connection } from "../src/server/db";
+import { db, d1 } from "../src/server/db";
+import { asSkillFiles, withContent } from "../src/server/files";
+import { startPlatform } from "./d1-platform";
 import {
   clients,
   skills,
@@ -55,8 +57,13 @@ const files = (id: string, body = "Read the docs.") => [
   makeFile("references/guide.md", "Reference content"),
 ];
 const headers = () => ({ Authorization: "Bearer " + allowedToken });
+const contents = async (r: { files: import("../src/shared").StoredFile[] }) =>
+  asSkillFiles(await withContent(r.files));
+const setting = async (id: string) =>
+  d1.prepare("SELECT value FROM workspace_settings WHERE id=?").bind(id).first();
+let platform: Awaited<ReturnType<typeof startPlatform>>;
 beforeAll(async () => {
-  await migrate();
+  platform = await startPlatform();
   // The isolated test database starts with no content or third-party configuration.
   expect((await search(ADMIN)).items).toEqual([]);
   expect(await (await import("../src/server/gateway")).gatewaySettings()).toMatchObject({ configured: false });
@@ -81,7 +88,7 @@ afterAll(async () => {
     .delete(events)
     .where(inArray(events.skillId, [...ids, ...graphIds, ...disabledIds]));
   await db.delete(events).where(eq(events.clientId, clientId));
-  await connection.end();
+  await platform.stop();
 });
 test("nested bundles deduplicate leaves, inherit grants and pin returned revisions", async () => {
   await saveBundle(
@@ -284,11 +291,11 @@ test("disable blocks every agent content path including pinned history, and enab
     expect((await search(ADMIN, id, 500, 0, false, true)).items).toHaveLength(
       1,
     );
-    expect((await revisionFor(ADMIN, id, original.revision)).files).toEqual(
+    expect(await contents(await revisionFor(ADMIN, id, original.revision))).toEqual(
       files(id),
     );
-    const current = await revisionFor(ADMIN, id);
-    expect(current.files.find((f) => f.path === "references/guide.md")).toEqual(
+    const current = await contents(await revisionFor(ADMIN, id));
+    expect(current.find((f) => f.path === "references/guide.md")).toEqual(
       files(id)[1],
     );
     await expect(
@@ -976,7 +983,7 @@ test("Gateway key requires owner Settings, stays encrypted and invalidates model
     expect(await saved.json()).toMatchObject({ configured: true });
     const status = await app.request("/api/settings/ai-gateway", { headers: ownerHeaders });
     expect(await status.json()).not.toHaveProperty("apiKey");
-    const stored = await connection`SELECT value FROM workspace_settings WHERE id='ai_gateway'`;
+    const stored = await setting("ai_gateway");
     expect(JSON.stringify(stored)).not.toContain("fixture-key-one");
     const one = await recommendSkills(principal, { task: "Quality" });
     expect(one.method).toBe("jev");
@@ -1024,7 +1031,7 @@ test("provider switching preserves separate encrypted keys, migrates Gateway set
     return Response.json({ model: "jev-latest", answers: Object.fromEntries(Object.keys(body.questions).map((id) => [id, { type: "score", score: 4, confidence: 0.95 }])), usage: direct ? { input_tokens: 100, output_tokens: 10 } : { inputTokens: 100, outputTokens: 10 } });
   }) as typeof fetch;
   try {
-    await connection`UPDATE workspace_settings SET value=${JSON.stringify(seal({ revision: "legacy-gateway-fixture", apiKey: "fixture-vercel-key" }))}::jsonb WHERE id='ai_gateway'`;
+    await d1.prepare("UPDATE workspace_settings SET value=? WHERE id='ai_gateway'").bind(JSON.stringify(seal({ revision: "legacy-gateway-fixture", apiKey: "fixture-vercel-key" }))).run();
     expect(await gatewaySettings()).toMatchObject({ provider: "vercel", configured: true, providers: { typesafe: { configured: false } } });
     expect((await recommendSkills(principal, { task: "Quality" })).provider).toBe("vercel");
     await configureGateway({ provider: "typesafe" });
@@ -1050,7 +1057,7 @@ test("provider switching preserves separate encrypted keys, migrates Gateway set
     await configureGateway({ provider: "openrouter", apiKey: "fixture-openrouter-key" });
     expect(await gatewaySettings()).toMatchObject({ provider: "openrouter", configured: true, providers: { vercel: { configured: true }, typesafe: { configured: true }, openrouter: { configured: true } } });
     expect(JSON.stringify(status)).not.toContain("fixture-");
-    const stored = await connection`SELECT value FROM workspace_settings WHERE id='ai_gateway'`;
+    const stored = await setting("ai_gateway");
     expect(JSON.stringify(stored)).not.toContain("fixture-");
     const invalid = await app.request("/api/settings/ai-gateway", { method: "PUT", headers: { Authorization: `Bearer ${process.env.SKILLBOX_ADMIN_TOKEN}`, "Content-Type": "application/json" }, body: JSON.stringify({ provider: "unknown" }) });
     expect(invalid.status).toBe(400);
@@ -1167,7 +1174,7 @@ test("icon revisions preserve files, survive catalog and reject stale or reader 
     (await search(ADMIN, id)).items.find((i) => i.id === id)?.icon,
   ).toEqual(icon);
   expect(
-    (await revisionFor(ADMIN, id)).files.find(
+    (await contents(await revisionFor(ADMIN, id))).find(
       (f) => f.path === "references/guide.md",
     )?.content,
   ).toBe(files(id)[1].content);
@@ -1187,7 +1194,7 @@ test("icon revisions preserve files, survive catalog and reject stale or reader 
   );
   expect(
     Buffer.from(
-      saved.files.find((f) => f.path === "SKILL.md")!.content,
+      (await contents(saved)).find((f) => f.path === "SKILL.md")!.content,
       "base64",
     ).toString(),
   ).not.toContain("data:image");
@@ -1199,7 +1206,9 @@ test("owner package metrics exclude legacy and UI reads from agent usage", async
   const r = await revisionFor(ADMIN, id);
   const { packageMetrics } = await import("../src/package-metrics");
   const before = await search(ADMIN, id, 500, 0, false, false, ["skill"], true);
-  expect(before.items[0]!.characters).toBe(packageMetrics(r.files).characters);
+  expect(before.items[0]!.characters).toBe(
+    packageMetrics(await contents(r)).characters,
+  );
   await load(ADMIN, id);
   await load({ ...ADMIN, context: { source: "web" } }, id);
   const legacy = await search(ADMIN, id, 500, 0, false, false, ["skill"], true);
@@ -1278,8 +1287,7 @@ test("Executor credentials stay encrypted and only owners can configure endpoint
     "https://executor.example.com/mcp",
     "test-secret-not-for-production",
   );
-  const stored =
-    await connection`SELECT value FROM workspace_settings WHERE id='executor'`;
+  const stored = await setting("executor");
   expect(JSON.stringify(stored)).not.toContain(
     "test-secret-not-for-production",
   );
@@ -1595,40 +1603,5 @@ test("separate create/update/delete permissions and proposals preserve revision 
     await db.delete(profiles).where(eq(profiles.id, profile.id));
     await db.delete(revisions).where(inArray(revisions.skillId, [id, other]));
     await db.delete(skills).where(inArray(skills.id, [id, other]));
-  }
-});
-test("legacy migration preserves key identity and exact grants, and is repeatable", async () => {
-  const id = randomUUID(),
-    secret = randomUUID(),
-    { sha256 } = await import("../src/server/library");
-  await connection`ALTER TABLE clients ALTER COLUMN profile_id DROP NOT NULL`;
-  await connection`INSERT INTO clients(id,name,token_hash,role,all_skills,skill_ids) VALUES(${id},'Migration fixture',${sha256(secret)},'reader',false,${JSON.stringify([ids[0]])}::jsonb)`;
-  try {
-    await migrate();
-    const p = await authenticate(
-      new Request("http://test/mcp", {
-        headers: { Authorization: "Bearer " + secret },
-      }),
-    );
-    expect(p.id).toBe(id);
-    expect(p.skillIds).toEqual([ids[0]]);
-    expect(p.permissions).toEqual({
-      create: false,
-      update: false,
-      delete: false,
-      propose: false,
-    });
-    await migrate();
-    expect(
-      (
-        await authenticate(
-          new Request("http://test/mcp", {
-            headers: { Authorization: "Bearer " + secret },
-          }),
-        )
-      ).profileId,
-    ).toBe(p.profileId);
-  } finally {
-    await db.delete(clients).where(eq(clients.id, id));
   }
 });

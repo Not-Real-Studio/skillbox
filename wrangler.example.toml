@@ -17,7 +17,8 @@ not_found_handling = "none"
 
 [[hyperdrive]]
 binding = "HYPERDRIVE"
-id = "<your-hyperdrive-id>"         # wrangler hyperdrive create skillbox --connection-string=...
+# wrangler hyperdrive create skillbox --connection-string=... --caching-disabled
+id = "<your-hyperdrive-id>"
 # Used by `wrangler dev` only.
 localConnectionString = "postgres://skillbox:skillbox@127.0.0.1:5432/skillbox"
 

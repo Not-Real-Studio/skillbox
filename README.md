@@ -145,6 +145,10 @@ bun run build
 bun run start
 ```
 
+## Cloudflare Workers
+
+The same build also runs as a Cloudflare Worker: `bun run build:worker && bun run deploy:worker`, with static files as Workers Static Assets and your PostgreSQL behind Hyperdrive (create it with caching disabled). The schema is migrated by `bun run migrate` at deploy time, not by the Worker. Plan for Workers Paid: the Free plan's 10 ms CPU and 50 subrequests per request break larger publishes and GitHub imports. Setup, limits and the repeatable local check (`scripts/test-worker.sh`) are in [docs/cloudflare.md](docs/cloudflare.md).
+
 ## Jev setup
 
 Open **Settings → Jev recommendations**, select **Vercel AI Gateway** (default), **TypeSafe AI**, or **OpenRouter**, and save that provider's API key. Keys are stored separately: switching providers never sends another provider's key, and switching back retains its saved key. Removing the selected provider's key disables its model calls. Skillbox does not auto-import environment keys, fetch credentials from a skill library, or ship an application-wide provider account.

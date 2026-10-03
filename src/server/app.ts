@@ -685,6 +685,28 @@ app.on(["GET", "DELETE"], "/mcp", async (c) => {
   await authenticate(c.req.raw);
   return c.json({ error: "Use POST for stateless MCP" }, 405);
 });
+// Plain-text read for agents without MCP: /raw/<id> (SKILL.md) and /raw/<id>/<path>.
+// Usually reached as /k/<clientKey>/raw/... (see worker.ts).
+const rawFile = async (c: any, id: string, path: string) => {
+  const p = await authenticate(c.req.raw);
+  const r = await lib.revisionFor(p, id);
+  const f = await lib.readFile(p, r.skillId, r.id, path);
+  let text = f.text;
+  if (path === "SKILL.md") {
+    const base = `${new URL(c.req.url).origin}${c.req.header("x-skillbox-prefix") ?? ""}/raw/${r.skillId}`;
+    const others = r.files.map((x: { path: string }) => x.path).filter((x: string) => x !== "SKILL.md");
+    text += `\n\n---\nskillbox: ${r.skillId}@${r.id}. Relative paths above resolve against ${base}/` +
+      (others.length ? `\nFiles:\n${others.map((x: string) => `- ${base}/${x}`).join("\n")}\n` : "\n");
+  }
+  c.header("Content-Type", "text/markdown; charset=utf-8");
+  return c.body(text);
+};
+app.get("/raw/:id", (c) => rawFile(c, c.req.param("id"), "SKILL.md"));
+app.get("/raw/:id/*", (c) => {
+  const id = c.req.param("id");
+  const rest = decodeURIComponent(c.req.path.slice(`/raw/${id}/`.length)) || "SKILL.md";
+  return rawFile(c, id, rest);
+});
 app.get("/bootstrap/SKILL.md", async (c) =>
   c.text(await required(c, "bootstrap/SKILL.md")),
 );

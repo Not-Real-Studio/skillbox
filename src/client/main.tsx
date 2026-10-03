@@ -56,6 +56,7 @@ import {
   Layers,
   PauseCircle,
   PlayCircle,
+  Link2,
 } from "lucide-react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -677,6 +678,56 @@ function LibraryPage() {
     </main>
   );
 }
+function ShareLink({ id }: { id: string }) {
+  const [shareId, setShareId] = useState<string | null>(null),
+    [ready, setReady] = useState(false),
+    [busy, setBusy] = useState(false),
+    [error, setError] = useState("");
+  useEffect(() => {
+    setReady(false);
+    api("/skills/" + id + "/share")
+      .then((r) => setShareId(r.shareId))
+      .catch((e) => setError(e.message))
+      .finally(() => setReady(true));
+  }, [id]);
+  const run = async (method: "POST" | "DELETE") => {
+    setBusy(true);
+    setError("");
+    try {
+      const r = await api("/skills/" + id + "/share", { method });
+      setShareId(method === "POST" ? r.shareId : null);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const url = shareId ? `${location.origin}/s/${shareId}` : "";
+  return (
+    <div className="file-tip share-link">
+      <Link2 size={16} />
+      <p>{shareId ? "Anyone with the link can read" : "Link sharing off"}</p>
+      {shareId && <code>{url}</code>}
+      {ready && (
+        <div className="share-actions">
+          {shareId ? (
+            <>
+              <CopyButton label="Copy link" text={url} />
+              <Button variant="outline" size="sm" disabled={busy} onClick={() => run("DELETE")}>
+                Turn off
+              </Button>
+            </>
+          ) : (
+            <Button variant="outline" size="sm" disabled={busy} onClick={() => run("POST")}>
+              Share by link
+            </Button>
+          )}
+        </div>
+      )}
+      {error && <p className="share-error">{error}</p>}
+    </div>
+  );
+}
 function SkillPage() {
   const { id } = skillRoute.useParams();
   const sourceRef = useRef<HTMLTextAreaElement>(null);
@@ -961,6 +1012,7 @@ function SkillPage() {
               text={`skillbox fetch ${id}@${loaded.revision}`}
             />
           </div>
+          {auth.role === "admin" && <ShareLink id={id} />}
         </aside>
         <section className="editor-main">
           <div className="editor-tabs">

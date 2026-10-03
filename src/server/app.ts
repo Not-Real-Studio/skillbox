@@ -7,10 +7,12 @@ import { Hono } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
-import { eq, desc, lt, and, sql } from "drizzle-orm";
+import { eq, desc, lt, and, sql, isNull } from "drizzle-orm";
+import { randomBytes } from "node:crypto";
+import { isIconAsset } from "../package-metrics";
 import { db } from "./db";
 import { noStaticFiles, type StaticFiles } from "./static-assets";
-import { clients, sessions, events, profiles, skills, nameKey } from "./schema";
+import { clients, sessions, events, profiles, skills, skillShares, nameKey } from "./schema";
 import { asSkillFiles, withContent } from "./files";
 import { uniqueViolation } from "./access";
 import {
@@ -685,27 +687,87 @@ app.on(["GET", "DELETE"], "/mcp", async (c) => {
   await authenticate(c.req.raw);
   return c.json({ error: "Use POST for stateless MCP" }, 405);
 });
-// Plain-text read for agents without MCP: /raw/<id> (SKILL.md) and /raw/<id>/<path>.
-// Usually reached as /k/<clientKey>/raw/... (see worker.ts).
-const rawFile = async (c: any, id: string, path: string) => {
-  const p = await authenticate(c.req.raw);
+// Link sharing ("anyone with the link"): /s/<shareId> → SKILL.md of the latest revision,
+// /s/<shareId>/<path> → a file; a bundle exposes its members as /s/<shareId>/~<member>/<path>.
+// The link grants read access to that one skill (and a bundle's members) and nothing else.
+const shareToken = () => randomBytes(18).toString("base64url");
+async function activeShare(skillId: string) {
+  const [row] = await db
+    .select()
+    .from(skillShares)
+    .where(and(eq(skillShares.skillId, skillId), isNull(skillShares.revokedAt)));
+  return row ?? null;
+}
+app.get("/api/skills/:id/share", async (c) => {
+  assertAdmin(c.get("principal"));
+  const row = await activeShare(c.req.param("id"));
+  return c.json({ shareId: row?.id ?? null, createdAt: row?.createdAt ?? null });
+});
+app.post("/api/skills/:id/share", async (c) => {
+  assertAdmin(c.get("principal"));
+  const r = await lib.revisionFor(c.get("principal"), c.req.param("id"));
+  await db
+    .update(skillShares)
+    .set({ revokedAt: new Date().toISOString() })
+    .where(and(eq(skillShares.skillId, r.skillId), isNull(skillShares.revokedAt)));
+  const id = shareToken();
+  await db.insert(skillShares).values({ id, skillId: r.skillId });
+  return c.json({ shareId: id });
+});
+app.delete("/api/skills/:id/share", async (c) => {
+  assertAdmin(c.get("principal"));
+  await db
+    .update(skillShares)
+    .set({ revokedAt: new Date().toISOString() })
+    .where(and(eq(skillShares.skillId, c.req.param("id")), isNull(skillShares.revokedAt)));
+  return c.json({ ok: true });
+});
+const sharedRead = async (c: any, shareId: string, rest: string) => {
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(shareId)) throw new lib.Problem(404, "Link not found");
+  const [share] = await db
+    .select()
+    .from(skillShares)
+    .where(and(eq(skillShares.id, shareId), isNull(skillShares.revokedAt)));
+  if (!share) throw new lib.Problem(404, "Link not found");
+  const p: Principal = {
+    id: "share:" + shareId.slice(0, 6),
+    name: "link " + share.skillId,
+    role: "reader",
+    allSkills: false,
+    skillIds: [share.skillId],
+    context: { source: "link" },
+  };
+  let id = share.skillId,
+    path = rest || "SKILL.md",
+    base = `${new URL(c.req.url).origin}/s/${shareId}`;
+  const member = path.match(/^~([a-z0-9][a-z0-9-]{0,79})(?:\/(.*))?$/);
+  if (member) {
+    id = member[1];
+    path = member[2] || "SKILL.md";
+    base += "/~" + id;
+  }
   const r = await lib.revisionFor(p, id);
-  const f = await lib.readFile(p, r.skillId, r.id, path);
-  let text = f.text;
+  let text = (await lib.readFile(p, r.skillId, r.id, path)).text;
   if (path === "SKILL.md") {
-    const base = `${new URL(c.req.url).origin}${c.req.header("x-skillbox-prefix") ?? ""}/raw/${r.skillId}`;
-    const others = r.files.map((x: { path: string }) => x.path).filter((x: string) => x !== "SKILL.md");
-    text += `\n\n---\nskillbox: ${r.skillId}@${r.id}. Relative paths above resolve against ${base}/` +
-      (others.length ? `\nFiles:\n${others.map((x: string) => `- ${base}/${x}`).join("\n")}\n` : "\n");
+    const others = r.files
+      .map((x: { path: string }) => x.path)
+      .filter((x: string) => x !== "SKILL.md" && !isIconAsset(x));
+    const members: string[] =
+      r.metadata.kind === "bundle" ? (r.metadata.members ?? []) : [];
+    text +=
+      `\n\n---\nskillbox: ${r.skillId}@${r.id}. Relative paths above resolve against ${base}/\n` +
+      (others.length ? `Files:\n${others.map((x: string) => `- ${base}/${x}`).join("\n")}\n` : "") +
+      (members.length
+        ? `Bundle members:\n${members.map((m) => `- ${new URL(c.req.url).origin}/s/${shareId}/~${m}`).join("\n")}\n`
+        : "");
   }
   c.header("Content-Type", "text/markdown; charset=utf-8");
   return c.body(text);
 };
-app.get("/raw/:id", (c) => rawFile(c, c.req.param("id"), "SKILL.md"));
-app.get("/raw/:id/*", (c) => {
-  const id = c.req.param("id");
-  const rest = decodeURIComponent(c.req.path.slice(`/raw/${id}/`.length)) || "SKILL.md";
-  return rawFile(c, id, rest);
+app.get("/s/:share", (c) => sharedRead(c, c.req.param("share"), ""));
+app.get("/s/:share/*", (c) => {
+  const share = c.req.param("share");
+  return sharedRead(c, share, decodeURIComponent(c.req.path.slice(`/s/${share}/`.length)));
 });
 app.get("/bootstrap/SKILL.md", async (c) =>
   c.text(await required(c, "bootstrap/SKILL.md")),

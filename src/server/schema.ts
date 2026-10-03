@@ -99,6 +99,14 @@ export const events = sqliteTable("events", {
   skillId: text("skill_id"),
   createdAt: text("created_at").notNull().$defaultFn(now),
 });
+export const skillShares = sqliteTable("skill_shares", {
+  id: text("id").primaryKey(),
+  skillId: text("skill_id")
+    .notNull()
+    .references(() => skills.id),
+  createdAt: text("created_at").notNull().$defaultFn(now),
+  revokedAt: text("revoked_at"),
+});
 export const workspaceSettings = sqliteTable("workspace_settings", {
   id: text("id").primaryKey(),
   value: text("value").notNull(),

@@ -22,14 +22,13 @@ export default {
         { status: 503 },
       );
     // Key in path: /k/<clientKey>/<rest> == <rest> with "Authorization: Bearer <clientKey>".
-    // For clients that cannot send headers (claude.ai connectors, plain fetch).
+    // For clients that cannot send headers (claude.ai custom connectors → /k/<key>/mcp).
     const m = new URL(request.url).pathname.match(/^\/k\/([A-Za-z0-9_-]{20,512})(\/.*)?$/);
     if (m) {
       const url = new URL(request.url);
       url.pathname = m[2] || "/";
       const headers = new Headers(request.headers);
       headers.set("authorization", `Bearer ${m[1]}`);
-      headers.set("x-skillbox-prefix", `/k/${m[1]}`);
       request = new Request(url.toString(), {
         method: request.method,
         headers,

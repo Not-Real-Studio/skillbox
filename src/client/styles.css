@@ -2406,3 +2406,7 @@ select option {
   padding: 14px 0;
   background: var(--background);
 }
+
+.share-link code { word-break: break-all; }
+.share-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.share-error { color: var(--destructive, #c33); font-size: 12px; }

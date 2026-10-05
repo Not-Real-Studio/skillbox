@@ -677,9 +677,29 @@ app.patch("/api/skills/:id/integrations", async (c) => {
     ),
   );
 });
+// CORS for /mcp: browser clients on other origins (a chat page running its backend in the
+// page, an artifact) call MCP directly. Auth is the Bearer key, never a cookie, so a page
+// without the key gets nothing: "*" without credentials is safe, and the Origin check stays
+// for key-less requests. Error responses carry the headers too — otherwise the browser
+// hides a 401 behind an opaque network error.
+const MCP_CORS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "authorization, content-type, accept, mcp-protocol-version, mcp-session-id, mcp-method, last-event-id",
+  "Access-Control-Expose-Headers": "mcp-session-id, mcp-protocol-version",
+  "Access-Control-Max-Age": "86400",
+};
+app.options("/mcp", () => new Response(null, { status: 204, headers: MCP_CORS }));
+app.use("/mcp", async (c, next) => {
+  await next();
+  c.res = new Response(c.res.body, c.res);
+  for (const [k, v] of Object.entries(MCP_CORS)) c.res.headers.set(k, v);
+});
 app.post("/mcp", async (c) => {
   const provided = c.req.header("Origin");
-  if (provided && !allowedOrigins().has(provided))
+  const keyed = /^Bearer \S/i.test(c.req.header("authorization") ?? "");
+  if (provided && !keyed && !allowedOrigins().has(provided))
     throw new lib.Problem(403, "Origin not allowed");
   return handleMcp(c.req.raw, await authenticate(c.req.raw));
 });

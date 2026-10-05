@@ -168,6 +168,23 @@ await check("MCP initialize", async () => {
   );
   return `protocol ${r.body.result.protocolVersion}`;
 });
+await check("MCP CORS: preflight and keyed POST from another origin", async () => {
+  const foreign = "http://localhost:5199";
+  const pre = await call("/mcp", {
+    method: "OPTIONS",
+    headers: {
+      Origin: foreign,
+      "Access-Control-Request-Method": "POST",
+      "Access-Control-Request-Headers": "authorization, content-type, mcp-protocol-version",
+    },
+  });
+  assert(pre.status === 204 && pre.headers.get("access-control-allow-origin") === "*", `preflight ${pre.status}`);
+  assert(/authorization/i.test(pre.headers.get("access-control-allow-headers") ?? ""), "no authorization in allow-headers");
+  const keyed = await mcp({ jsonrpc: "2.0", id: 9, method: "tools/list", params: {} }, { Origin: foreign, "MCP-Protocol-Version": "2025-06-18" });
+  assert(keyed.status === 200 && keyed.headers.get("access-control-allow-origin") === "*", `keyed ${keyed.status} ${keyed.text.slice(0, 200)}`);
+  const anon = await call("/mcp", { method: "POST", headers: { Origin: foreign, "Content-Type": "application/json" }, body: "{}" });
+  assert(anon.status === 403 && anon.headers.get("access-control-allow-origin") === "*", `anonymous foreign POST gave ${anon.status}`);
+});
 await check("MCP tools/list", async () => {
   const r = await mcp(
     { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },

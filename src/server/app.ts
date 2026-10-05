@@ -686,7 +686,7 @@ const MCP_CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
   "Access-Control-Allow-Headers":
-    "authorization, content-type, accept, mcp-protocol-version, mcp-session-id, mcp-method, last-event-id",
+    "authorization, content-type, accept, mcp-protocol-version, mcp-session-id, mcp-method, mcp-name, last-event-id",
   "Access-Control-Expose-Headers": "mcp-session-id, mcp-protocol-version",
   "Access-Control-Max-Age": "86400",
 };
